@@ -1,6 +1,7 @@
 //! Pure DSP / domain layer. No `cpal`, no `midir`, no allocation after
 //! construction. Everything here is unit-testable offline.
 
+pub mod biquad;
 pub mod delay_line;
 pub mod dispersion;
 pub mod engine;
@@ -8,6 +9,7 @@ pub mod filter;
 pub mod hammer;
 pub mod midi_event;
 pub mod rng;
+pub mod soundboard;
 pub mod string;
 pub mod string_group;
 pub mod voice;
