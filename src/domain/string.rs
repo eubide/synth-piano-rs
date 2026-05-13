@@ -1,28 +1,35 @@
-//! Single Karplus-Strong string driven by an external excitation signal.
+//! Single Karplus-Strong string with a dispersion-allpass cascade in the loop.
 //!
-//! ## Algorithm (Extended Karplus-Strong, Jaffe & Smith 1983)
+//! ## Algorithm (Extended Karplus-Strong, Jaffe & Smith 1983 + dispersion)
 //!
 //! On every audio sample:
 //!   `read    = delay.read_frac(N_int, frac)`
 //!   `lpf_out = lpf.tick(read)`
-//!   `y       = lpf_out + excitation`     ← hammer / pluck enters here
+//!   `disp    = dispersion.tick(lpf_out)`
+//!   `y       = disp + excitation`        ← hammer enters here, undispersed
 //!   `delay.write(y)`
 //!   `output  = y`
 //!
-//! ## Why the excitation is added *after* the loop filter
-//! Jaffe & Smith's formulation keeps the excitation outside the loop's
-//! feedback path on its first pass: the player hears the unfiltered strike
-//! immediately, and subsequent circulations get filtered like any other
-//! energy. Adding it before the LPF instead would double-filter the strike
-//! and dull the transient.
-//!
 //! ## Tuning compensation
-//! The two-tap loop filter has exactly ½-sample phase delay, so we tune by
-//! splitting `total_delay = Fs/f` as `N_int + frac + 0.5`. The integer part
-//! is realised by the ring-buffer index; the fraction by linear interp in
-//! [`DelayLine::read_frac`].
+//! The loop has three delay-affecting components: the integer + fractional
+//! delay line, the two-tap LPF (constant ½-sample phase delay), and the
+//! dispersion cascade (group delay varies with frequency). To make the
+//! fundamental land on the requested `f₀`, we set:
+//!   `D + 0.5 + N·τ_g(ω₀) = Fs / f₀`
+//! and recover `D` from there. The cascade group delay is computed
+//! analytically at `ω₀` (not at DC) — important for high notes where the
+//! difference matters.
+//!
+//! ## Where the dispersion lives
+//! After the loop LPF, before the excitation injection. The excitation is
+//! kept undispersed for the same reason it's kept un-LPF'd in Phase 3: the
+//! player hears the strike's natural transient on the first pass, and only
+//! subsequent loop circulations get filtered + dispersed.
+
+use std::f32::consts::TAU;
 
 use crate::domain::delay_line::DelayLine;
+use crate::domain::dispersion::DispersionCascade;
 use crate::domain::filter::TwoTapLowpass;
 
 #[derive(Debug)]
@@ -30,23 +37,19 @@ pub struct KarplusStrong {
     sample_rate: f32,
     delay: DelayLine,
     lpf: TwoTapLowpass,
-    /// Integer part of the loop delay, in samples.
+    dispersion: DispersionCascade,
     delay_int: usize,
-    /// Fractional remainder, [0, 1).
     delay_frac: f32,
     active: bool,
 }
 
 impl KarplusStrong {
-    /// `max_delay` is the longest delay the line must support, in samples.
-    /// At 48 kHz, A0 (27.5 Hz) needs ≈ 1745 samples — so a `max_delay` of
-    /// 2400 (corresponding to 20 Hz minimum) covers the full piano range
-    /// with slack for future detuning.
     pub fn new(sample_rate: f32, max_delay: usize) -> Self {
         Self {
             sample_rate,
             delay: DelayLine::new(max_delay),
             lpf: TwoTapLowpass::new(),
+            dispersion: DispersionCascade::new(),
             delay_int: 1,
             delay_frac: 0.0,
             active: false,
@@ -61,27 +64,37 @@ impl KarplusStrong {
         self.active = false;
     }
 
-    /// Arm the string at a given fundamental frequency. Clears the delay
-    /// line and the loop-filter state; does NOT inject any energy. Energy
-    /// is supplied per-sample via [`Self::tick`]'s `excitation` argument.
+    /// Arm the string at a given fundamental frequency. Clears delay,
+    /// loop filter and dispersion state, picks a per-note dispersion
+    /// coefficient, and tunes the delay length so `f₀` still lands on
+    /// target despite the cascade's contribution.
     pub fn pluck(&mut self, freq: f32) {
-        let total = (self.sample_rate / freq) - 0.5;
-        // Clamp to a safe range: at least 2 samples (read taps at d_int and
-        // d_int+1 must both lie inside the buffer), at most capacity-2 to
-        // keep the second tap in bounds.
+        // 1. Pick dispersion strength for this note.
+        self.dispersion.fit_to_frequency(freq, self.sample_rate);
+
+        // 2. Tune the delay line. Subtract LPF phase delay (½) and the
+        //    cascade's group delay *at the fundamental*. Using ω₀ rather
+        //    than DC keeps high notes in tune.
+        let omega_0 = TAU * freq / self.sample_rate;
+        let cascade_delay = self.dispersion.group_delay_at(omega_0);
+        let total = self.sample_rate / freq - 0.5 - cascade_delay;
+
+        // 3. Clamp to the buffer-imposed window. Notes that need more than
+        //    the buffer holds get clipped at the bottom; notes whose total
+        //    would go below 2 samples (extreme treble) get clipped at the
+        //    top — pitch will be slightly off but the loop stays stable.
         let max_total = (self.delay.capacity() - 2) as f32;
         let total = total.clamp(2.0, max_total);
         self.delay_int = total.floor() as usize;
         self.delay_frac = total - self.delay_int as f32;
 
+        // 4. Wipe state. Energy enters only via tick()'s `excitation`.
         self.delay.clear();
         self.lpf.reset();
+        self.dispersion.reset();
         self.active = true;
     }
 
-    /// Render one sample. `excitation` is added to the loop output and the
-    /// new value written back into the delay line. Pass `0.0` when no
-    /// external force is acting.
     #[inline]
     pub fn tick(&mut self, excitation: f32) -> f32 {
         if !self.active {
@@ -89,7 +102,8 @@ impl KarplusStrong {
         }
         let read = self.delay.read_frac(self.delay_int, self.delay_frac);
         let lpf_out = self.lpf.tick(read);
-        let y = lpf_out + excitation;
+        let disp = self.dispersion.tick(lpf_out);
+        let y = disp + excitation;
         self.delay.write(y);
         y
     }
@@ -99,9 +113,6 @@ impl KarplusStrong {
 mod tests {
     use super::*;
 
-    /// Autocorrelation-based period detection. Returns the integer lag at
-    /// which the (biased) autocorrelation is maximised, restricted to
-    /// `[min_lag, max_lag]`.
     fn detect_period_samples(samples: &[f32], min_lag: usize, max_lag: usize) -> usize {
         let mut best_lag = min_lag;
         let mut best_score = f32::NEG_INFINITY;
@@ -124,8 +135,6 @@ mod tests {
         sample_rate / period_samples as f32
     }
 
-    /// Test helper: render a string given a single impulse of unit amplitude
-    /// on the first tick, then zeros. Used to characterise loop behaviour.
     fn render_impulse_response(s: &mut KarplusStrong, n: usize) -> Vec<f32> {
         let mut buf = vec![0.0; n];
         buf[0] = s.tick(1.0);
@@ -145,7 +154,6 @@ mod tests {
 
     #[test]
     fn unplucked_string_ignores_excitation() {
-        // The string is inert until `pluck()`; excitation should be discarded.
         let mut s = KarplusStrong::new(48_000.0, 4096);
         for _ in 0..16 {
             assert_eq!(s.tick(1.0), 0.0);
@@ -154,13 +162,16 @@ mod tests {
 
     #[test]
     fn impulse_response_a4_has_period_near_109_samples() {
+        // With dispersion the fundamental can sit a sample or two off from
+        // a no-dispersion baseline — widen the autocorrelation search and
+        // the tolerance slightly to account for that.
         let mut s = KarplusStrong::new(48_000.0, 4096);
         s.pluck(440.0);
         let buf = render_impulse_response(&mut s, 8_192);
-        let lag = detect_period_samples(&buf[200..], 90, 130);
+        let lag = detect_period_samples(&buf[400..], 80, 140);
         let f = pitch_from_period(lag, 48_000.0);
         assert!(
-            (f - 440.0).abs() / 440.0 < 0.02,
+            (f - 440.0).abs() / 440.0 < 0.03,
             "got {f} Hz at lag {lag}, expected ~440"
         );
     }
@@ -170,10 +181,10 @@ mod tests {
         let mut s = KarplusStrong::new(48_000.0, 4096);
         s.pluck(261.625_56);
         let buf = render_impulse_response(&mut s, 8_192);
-        let lag = detect_period_samples(&buf[200..], 150, 220);
+        let lag = detect_period_samples(&buf[400..], 140, 220);
         let f = pitch_from_period(lag, 48_000.0);
         assert!(
-            (f - 261.625_56).abs() / 261.625_56 < 0.02,
+            (f - 261.625_56).abs() / 261.625_56 < 0.03,
             "got {f} Hz at lag {lag}, expected ~261.63"
         );
     }
@@ -183,7 +194,6 @@ mod tests {
         let mut s = KarplusStrong::new(48_000.0, 4096);
         s.pluck(440.0);
         let buf = render_impulse_response(&mut s, 48_000);
-        // Compare RMS shortly after the impulse vs near the end.
         let early_rms: f32 = buf[200..1_224].iter().map(|x| x * x).sum::<f32>().sqrt();
         let late_rms: f32 = buf[buf.len() - 1_024..]
             .iter()
@@ -199,13 +209,45 @@ mod tests {
     #[test]
     fn extreme_frequency_does_not_panic() {
         let mut s = KarplusStrong::new(48_000.0, 4096);
-        s.pluck(0.5); // below buffer-imposed minimum — clamps
+        s.pluck(0.5);
         for _ in 0..1_000 {
             s.tick(0.0);
         }
-        s.pluck(40_000.0); // above Nyquist — clamps
+        s.pluck(40_000.0);
         for _ in 0..1_000 {
             s.tick(0.0);
         }
+    }
+
+    #[test]
+    fn loop_stays_bounded_over_a_second() {
+        // Smoke test: with dispersion + LPF + delay all in the loop, the
+        // total gain must be ≤ 1 at every frequency. Any latent instability
+        // shows up as exponentially growing samples within a few seconds.
+        let mut s = KarplusStrong::new(48_000.0, 4096);
+        s.pluck(220.0);
+        let mut peak = 0.0f32;
+        let mut sample = s.tick(1.0);
+        peak = peak.max(sample.abs());
+        for _ in 1..48_000 {
+            sample = s.tick(0.0);
+            peak = peak.max(sample.abs());
+        }
+        // Initial impulse is 1.0; after passing through the loop a few
+        // times the peak should be ≤ 1.0 (LPF removes energy each pass).
+        assert!(peak <= 1.0 + 1e-3, "loop blew up, peak={peak}");
+    }
+
+    #[test]
+    fn high_note_falls_back_to_zero_dispersion() {
+        // C8 — its short loop can't accommodate any dispersion, so the
+        // cascade collapses to N pure sample delays. The KS algorithm
+        // should still produce a stable, audible signal.
+        let mut s = KarplusStrong::new(48_000.0, 4096);
+        s.pluck(4_186.0);
+        let buf = render_impulse_response(&mut s, 2_048);
+        let energy: f32 = buf.iter().map(|x| x * x).sum();
+        assert!(energy > 0.0, "no signal at C8");
+        assert!(energy.is_finite(), "C8 loop diverged");
     }
 }

@@ -2,6 +2,7 @@
 //! construction. Everything here is unit-testable offline.
 
 pub mod delay_line;
+pub mod dispersion;
 pub mod engine;
 pub mod filter;
 pub mod hammer;
