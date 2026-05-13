@@ -1,0 +1,39 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Backtrace / perf
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+.nvim.lua
+
+# Logs
+*.log
