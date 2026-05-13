@@ -12,6 +12,7 @@ pub mod rng;
 pub mod soundboard;
 pub mod string;
 pub mod string_group;
+pub mod sympathetic;
 pub mod voice;
 
 pub use engine::{Engine, MAX_VOICES};
