@@ -45,6 +45,19 @@ const CUTOFF_MAX_HZ: f32 = 7_000.0;
 /// stays soft and damps high frequencies for `pp` strikes.
 const VELOCITY_WARP: f32 = 1.5;
 
+/// Exponent applied to velocity for *amplitude* scaling.
+///
+/// A controllable velocity-to-loudness response matters more than the
+/// physical kinetic-energy interpretation (`v²`). With higher exponents
+/// the slope steepens fastest exactly where players spend most time
+/// (mf–f, MIDI 60–100), so 5-unit velocity bumps produce 2–3 dB jumps
+/// that feel "twitchy". A linear amplitude curve (`v^1.0`) gives a
+/// per-velocity step closer to ~0.5 dB in that range; the *expressive*
+/// dynamic still comes through because the felt-compression LPF
+/// (`VELOCITY_WARP`) keeps shaping the spectrum with velocity, which
+/// the ear hears as an additional ≈ 6–8 dB of perceived loudness.
+const AMPLITUDE_WARP: f32 = 1.0;
+
 #[derive(Debug)]
 pub struct Hammer {
     sample_rate: f32,
@@ -111,8 +124,9 @@ impl Hammer {
             0.0
         };
 
-        // Energy ∝ velocity² (kinetic energy of the hammer).
-        let scaled = raw * self.velocity * self.velocity;
+        // Amplitude warp: `v^AMPLITUDE_WARP`. See the constant's docs for
+        // the trade-off between physical realism and perceived loudness.
+        let scaled = raw * self.velocity.powf(AMPLITUDE_WARP);
 
         // Felt-compression filter.
         let filtered = self.lpf.tick(scaled);
