@@ -1,7 +1,4 @@
 /// Domain-level MIDI event. Adapters translate raw bytes into these.
-///
-/// We keep this enum minimal in Phase 1 (note on / off / all-notes-off).
-/// Later phases will add `SustainPedal`, `Aftertouch`, etc.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MidiEvent {
     /// Note on with MIDI note number (0..127) and velocity (1..127).
@@ -11,6 +8,11 @@ pub enum MidiEvent {
     NoteOff { note: u8 },
     /// All Notes Off (CC 123). Silences every active voice immediately.
     AllNotesOff,
+    /// Sustain pedal (CC 64). `down` follows the MIDI convention:
+    /// values ≥ 64 → `true`, < 64 → `false`. While `down`, note-offs are
+    /// deferred until the pedal goes up; sympathetic resonance is freed
+    /// to ring.
+    SustainPedal { down: bool },
 }
 
 impl MidiEvent {

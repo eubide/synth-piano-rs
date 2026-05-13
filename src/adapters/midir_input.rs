@@ -82,8 +82,9 @@ pub(crate) fn parse_message(msg: &[u8]) -> Option<MidiEvent> {
             }
         }
         0x80 if msg.len() >= 3 => Some(MidiEvent::NoteOff { note: msg[1] }),
-        // Control Change: only CC 123 (All Notes Off) for Phase 1.
+        // Control Change: CC 64 (sustain pedal) and CC 123 (All Notes Off).
         0xB0 if msg.len() >= 3 => match msg[1] {
+            64 => Some(MidiEvent::SustainPedal { down: msg[2] >= 64 }),
             123 => Some(MidiEvent::AllNotesOff),
             _ => None,
         },
@@ -130,6 +131,30 @@ mod tests {
     #[test]
     fn unknown_cc_is_ignored() {
         assert_eq!(parse_message(&[0xB0, 7, 100]), None);
+    }
+
+    #[test]
+    fn sustain_pedal_down_parses_at_value_above_64() {
+        assert_eq!(
+            parse_message(&[0xB0, 64, 127]),
+            Some(MidiEvent::SustainPedal { down: true })
+        );
+        assert_eq!(
+            parse_message(&[0xB0, 64, 64]),
+            Some(MidiEvent::SustainPedal { down: true })
+        );
+    }
+
+    #[test]
+    fn sustain_pedal_up_parses_at_value_below_64() {
+        assert_eq!(
+            parse_message(&[0xB0, 64, 0]),
+            Some(MidiEvent::SustainPedal { down: false })
+        );
+        assert_eq!(
+            parse_message(&[0xB0, 64, 63]),
+            Some(MidiEvent::SustainPedal { down: false })
+        );
     }
 
     #[test]

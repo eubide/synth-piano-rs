@@ -41,6 +41,12 @@ pub struct KarplusStrong {
     delay_int: usize,
     delay_frac: f32,
     active: bool,
+    /// Multiplicative loss applied to the loop output before it is written
+    /// back into the delay line. `1.0` = no extra loss (the LPF still
+    /// damps HF), values below 1 model felt damping that engages with the
+    /// string mid-vibration. Used by the sympathetic bank to simulate
+    /// damper-on / damper-off behaviour.
+    loop_gain: f32,
 }
 
 impl KarplusStrong {
@@ -53,7 +59,20 @@ impl KarplusStrong {
             delay_int: 1,
             delay_frac: 0.0,
             active: false,
+            loop_gain: 1.0,
         }
+    }
+
+    /// Set per-cycle multiplicative loop loss. `1.0` = transparent (the
+    /// default); values like `0.985` damp the entire spectrum by ~1.5 %
+    /// per loop cycle. Frequency-independent — for piano-correct damping
+    /// the LPF inside the loop already shapes the loss by frequency.
+    pub fn set_loop_gain(&mut self, gain: f32) {
+        self.loop_gain = gain.clamp(0.0, 1.0);
+    }
+
+    pub fn loop_gain(&self) -> f32 {
+        self.loop_gain
     }
 
     pub fn is_active(&self) -> bool {
@@ -104,7 +123,11 @@ impl KarplusStrong {
         let lpf_out = self.lpf.tick(read);
         let disp = self.dispersion.tick(lpf_out);
         let y = disp + excitation;
-        self.delay.write(y);
+        // Apply loop loss to the *recirculated* portion only. The voice
+        // hears `y` (with the excitation intact), while the delay line
+        // stores `y · loop_gain` so subsequent passes lose energy. With
+        // loop_gain = 1.0 this is a no-op multiply.
+        self.delay.write(y * self.loop_gain);
         y
     }
 }
@@ -236,6 +259,31 @@ mod tests {
         // Initial impulse is 1.0; after passing through the loop a few
         // times the peak should be ≤ 1.0 (LPF removes energy each pass).
         assert!(peak <= 1.0 + 1e-3, "loop blew up, peak={peak}");
+    }
+
+    #[test]
+    fn lower_loop_gain_speeds_up_decay() {
+        // Two strings, same pluck, different loop_gain. The one with
+        // smaller loop_gain must have lower RMS in the long-term tail.
+        fn render_with_loop_gain(g: f32) -> f32 {
+            let mut s = KarplusStrong::new(48_000.0, 4096);
+            s.pluck(440.0);
+            s.set_loop_gain(g);
+            let mut buf = vec![0.0; 24_000];
+            buf[0] = s.tick(1.0);
+            for v in buf.iter_mut().skip(1) {
+                *v = s.tick(0.0);
+            }
+            let tail = &buf[buf.len() - 2_048..];
+            let energy: f32 = tail.iter().map(|x| x * x).sum();
+            (energy / tail.len() as f32).sqrt()
+        }
+        let rms_full = render_with_loop_gain(1.0);
+        let rms_damped = render_with_loop_gain(0.985);
+        assert!(
+            rms_damped < rms_full * 0.5,
+            "expected loop_gain 0.985 to damp faster: full={rms_full} damped={rms_damped}"
+        );
     }
 
     #[test]
