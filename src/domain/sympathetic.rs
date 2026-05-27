@@ -71,8 +71,11 @@ pub struct Sympathetic {
 
 impl Sympathetic {
     pub fn new(sample_rate: f32) -> Self {
-        // Same delay-line capacity rules as Voice's strings.
-        let max_delay = (sample_rate / 20.0).ceil() as usize;
+        // Size the delay line to the lowest sympathetic note (C4) with a
+        // 50 % margin for cascade group delay and short-rate variation.
+        // 8× smaller than Voice's bass-friendly 20 Hz floor.
+        let lowest_freq = midi_to_hz(BASE_NOTE);
+        let max_delay = (sample_rate * 1.5 / lowest_freq).ceil() as usize;
         let mut strings: [KarplusStrong; N_STRINGS] = std::array::from_fn(|_| {
             KarplusStrong::new(sample_rate, max_delay)
         });
