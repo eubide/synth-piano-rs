@@ -122,18 +122,31 @@ impl Engine {
                 }
             }
             MidiEvent::SustainPedal { down } => {
-                let was_down = self.sustain_pedal_down;
+                if self.sustain_pedal_down == down {
+                    return;
+                }
                 self.sustain_pedal_down = down;
                 self.sympathetic.set_pedal(down);
-                if was_down && !down {
-                    // Pedal just lifted — flush the pending note-offs.
+                if down {
+                    // Pedal pressed: lift the damper off any voice mid-release.
+                    // Real piano — pressing the pedal physically retracts the
+                    // damper bar, so a string that was being muted by the felt
+                    // keeps ringing at whatever amplitude it had reached. We
+                    // re-mark the note as pending so it resumes releasing once
+                    // the pedal lifts again.
+                    for v in &mut self.voices {
+                        if v.is_active() && v.is_released() {
+                            self.pending_note_offs[v.note() as usize] = true;
+                            v.cancel_release();
+                        }
+                    }
+                } else {
+                    // Pedal lifted: flush every pending note-off in one pass.
                     for note in 0..128u8 {
                         if self.pending_note_offs[note as usize] {
                             self.release_voice(note);
+                            self.pending_note_offs[note as usize] = false;
                         }
-                    }
-                    for b in &mut self.pending_note_offs {
-                        *b = false;
                     }
                 }
             }

@@ -24,9 +24,19 @@ pub fn midi_to_hz(note: u8) -> f32 {
     440.0 * ((note as f32 - 69.0) / 12.0).exp2()
 }
 
-const DAMPER_TAU_SECS: f32 = 0.08;
 const DAMPER_GATE_THRESHOLD: f32 = 1.0e-4;
 const MIN_FREQUENCY_HZ: f32 = 20.0;
+
+/// Per-sample damper-gain decay factor for `note`. Real piano dampers are
+/// felts whose engagement time depends on the string they meet: bass
+/// strings carry much more energy and the felt takes ≈ 100 ms to mute
+/// them; treble strings stop almost instantly under their tiny dampers.
+/// We linearly taper τ across the playable range A0..C8.
+fn damper_decay_per_sample(note: u8, sample_rate: f32) -> f32 {
+    let t = (note.min(108).saturating_sub(21) as f32 / 87.0).clamp(0.0, 1.0);
+    let tau_secs = 0.12 - t * 0.08;
+    (-1.0 / (tau_secs * sample_rate)).exp()
+}
 
 #[derive(Debug)]
 pub struct Voice {
@@ -42,14 +52,14 @@ pub struct Voice {
 impl Voice {
     pub fn new(sample_rate: f32) -> Self {
         let max_delay = (sample_rate / MIN_FREQUENCY_HZ).ceil() as usize;
-        let damper_decay = (-1.0 / (DAMPER_TAU_SECS * sample_rate)).exp();
         Self {
             sample_rate,
             strings: StringGroup::new(sample_rate, max_delay),
             hammer: Hammer::new(sample_rate),
             note: 0,
             damper_gain: 0.0,
-            damper_decay,
+            // Overwritten on every note_on with a note-dependent value.
+            damper_decay: 1.0,
             released: false,
         }
     }
@@ -76,6 +86,7 @@ impl Voice {
         let v = (velocity as f32 / 127.0).clamp(0.0, 1.0);
         self.strings.pluck(freq, n_strings);
         self.hammer.fire(v);
+        self.damper_decay = damper_decay_per_sample(note, self.sample_rate);
         self.damper_gain = 1.0;
         self.released = false;
     }
@@ -84,6 +95,14 @@ impl Voice {
         if self.strings.is_active() {
             self.released = true;
         }
+    }
+
+    /// Lift the damper off a voice that was already in release decay.
+    /// `damper_gain` keeps its current (partially decayed) value — the
+    /// felt had been engaging before the pedal pulled it back, so the
+    /// string continues to ring at the amplitude it had reached.
+    pub fn cancel_release(&mut self) {
+        self.released = false;
     }
 
     #[inline]
