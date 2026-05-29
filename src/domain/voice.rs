@@ -27,14 +27,30 @@ pub fn midi_to_hz(note: u8) -> f32 {
 const DAMPER_GATE_THRESHOLD: f32 = 1.0e-4;
 const MIN_FREQUENCY_HZ: f32 = 20.0;
 
+/// MIDI note numbers bounding the 88-key piano: A0 and C8. The damper
+/// taper is defined across this range; notes outside it pin to the ends.
+const LOWEST_KEY: u8 = 21;
+const HIGHEST_KEY: u8 = 108;
+
+/// Damper time constant at the bass end (A0) — the felt takes ≈ 120 ms to
+/// mute the heavy, energetic low strings.
+const DAMPER_TAU_BASS_SECS: f32 = 0.12;
+/// How much shorter τ gets at the treble end (C8): 0.12 − 0.08 = 0.04 s,
+/// a near-instant mute under the tiny treble dampers. Must stay below
+/// [`DAMPER_TAU_BASS_SECS`] so τ never reaches zero (see the
+/// `damper_decay_never_reaches_unity` test).
+const DAMPER_TAU_RANGE_SECS: f32 = 0.08;
+
 /// Per-sample damper-gain decay factor for `note`. Real piano dampers are
 /// felts whose engagement time depends on the string they meet: bass
-/// strings carry much more energy and the felt takes ≈ 100 ms to mute
-/// them; treble strings stop almost instantly under their tiny dampers.
-/// We linearly taper τ across the playable range A0..C8.
+/// strings carry much more energy and the felt takes longer to mute them;
+/// treble strings stop almost instantly under their tiny dampers. We
+/// linearly taper τ across the playable range A0..C8. The `clamp` alone
+/// bounds out-of-range notes, so no separate `min`/`max` is needed.
 fn damper_decay_per_sample(note: u8, sample_rate: f32) -> f32 {
-    let t = (note.min(108).saturating_sub(21) as f32 / 87.0).clamp(0.0, 1.0);
-    let tau_secs = 0.12 - t * 0.08;
+    let span = (HIGHEST_KEY - LOWEST_KEY) as f32;
+    let t = (note.saturating_sub(LOWEST_KEY) as f32 / span).clamp(0.0, 1.0);
+    let tau_secs = DAMPER_TAU_BASS_SECS - t * DAMPER_TAU_RANGE_SECS;
     (-1.0 / (tau_secs * sample_rate)).exp()
 }
 
@@ -59,7 +75,11 @@ impl Voice {
             note: 0,
             damper_gain: 0.0,
             // Overwritten on every note_on with a note-dependent value.
-            damper_decay: 1.0,
+            // 0.0 (instant gate) is the safe placeholder: were a voice ever
+            // to enter release without a preceding note_on, it would gate to
+            // silence at once rather than ring forever — which a 1.0 "no
+            // decay" default would cause.
+            damper_decay: 0.0,
             released: false,
         }
     }
@@ -141,6 +161,24 @@ mod tests {
     #[test]
     fn c4_resolves_to_about_261_63() {
         assert!((midi_to_hz(60) - 261.625_56).abs() < 1e-2);
+    }
+
+    #[test]
+    fn damper_decay_never_reaches_unity() {
+        // The decay factor must stay strictly inside (0, 1) across the whole
+        // MIDI range. A factor ≥ 1.0 would make a released voice's
+        // damper_gain hold or grow, so it would never cross the gate — a
+        // runaway/stuck voice on the RT thread. This locks the invariant
+        // τ > 0, i.e. DAMPER_TAU_RANGE_SECS < DAMPER_TAU_BASS_SECS.
+        for sr in [44_100.0, 48_000.0, 96_000.0] {
+            for note in 0..=127u8 {
+                let d = damper_decay_per_sample(note, sr);
+                assert!(
+                    d > 0.0 && d < 1.0,
+                    "damper decay out of (0,1) at note {note}, sr {sr}: {d}"
+                );
+            }
+        }
     }
 
     #[test]
