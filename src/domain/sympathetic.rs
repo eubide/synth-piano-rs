@@ -1,19 +1,21 @@
 //! Sympathetic-resonance bank.
 //!
-//! ## Why 12 strings cover the whole keyboard
+//! ## Why two octaves of strings cover the whole keyboard
 //! A Karplus-Strong string with fundamental `f₀` resonates at every
 //! integer multiple `k·f₀` — its loop transfer function has gain peaks at
-//! all positive harmonics. If we instantiate 12 strings whose
-//! fundamentals are the 12 chromatic notes of a single octave, the union
-//! of their harmonic series tiles the entire frequency axis with at most
-//! ~5.95 % spacing (one semitone). Every note in equal temperament lands
-//! on or very close to a harmonic of some sympathetic string, so it can
-//! drive that string sympathetically.
+//! all positive harmonics. A single chromatic octave already tiles the
+//! frequency axis through those harmonics, but harmonic coupling is weak
+//! and treble-biased: a low note whose fundamental sits *below* the bank
+//! only drives the bank's strings at its upper partials, so the deep,
+//! enveloping "bass bloom" of a real pedalled piano is missing.
 //!
-//! Twelve KS instances is two orders of magnitude cheaper than the 88
-//! that a literal "all undamped strings" simulation would require, with
-//! essentially no audible loss because the union of their resonances
-//! already covers everything an audible note could excite.
+//! We therefore span **two chromatic octaves (C2..B3, 24 strings)**. The
+//! lower octave gives bass and tenor notes a sympathetic string at (or an
+//! octave from) their own fundamental — the strongest coupling there is —
+//! restoring the bass bloom, while the union of all 24 harmonic series
+//! still blankets the treble. 24 KS instances is far cheaper than the 88
+//! a literal "all undamped strings" simulation would need, with no audible
+//! gap in coverage.
 //!
 //! ## How the pedal couples in
 //! - **Pedal up (default)**: every string's loop gain is set just below 1.0
@@ -38,12 +40,13 @@
 use crate::domain::string::KarplusStrong;
 use crate::domain::voice::midi_to_hz;
 
-/// Lowest sympathetic note (C4 = MIDI 60).
-const BASE_NOTE: u8 = 60;
+/// Lowest sympathetic note (C2 = MIDI 36). The bank spans up from here.
+const BASE_NOTE: u8 = 36;
 
-/// One octave of chromatic strings — covers all equal-temperament
-/// pitches through harmonic relationships.
-pub const N_STRINGS: usize = 12;
+/// Two chromatic octaves of strings (C2..B3) — the lower octave restores
+/// sympathetic coupling for the bass/tenor register; harmonics of all 24
+/// cover everything above.
+pub const N_STRINGS: usize = 24;
 
 /// Loop gain when the damper is on. The dampers of a real piano are
 /// felts that *strongly* mute the strings — typical decay times when a
@@ -60,9 +63,10 @@ const PEDAL_DOWN_LOOP_GAIN: f32 = 1.0;
 /// the listener should hear "halo" rather than a parallel copy.
 pub const EXCITATION_SEND: f32 = 0.08;
 
-/// Output trim. The 12 strings sum and we want the bank to sit clearly
-/// below the played voices.
-const OUTPUT_GAIN: f32 = 0.05;
+/// Output trim. The 24 strings sum and we want the bank to sit clearly
+/// below the played voices; trimmed down from the 12-string value to keep
+/// the halo at the same modest level now that twice as many strings sum.
+const OUTPUT_GAIN: f32 = 0.035;
 
 #[derive(Debug)]
 pub struct Sympathetic {
@@ -71,19 +75,16 @@ pub struct Sympathetic {
 
 impl Sympathetic {
     pub fn new(sample_rate: f32) -> Self {
-        // Size the delay line to the lowest sympathetic note (C4, the
-        // longest delay this bank ever needs — every string is ≥ C4). The
+        // Size the delay line to the lowest sympathetic note — `BASE_NOTE`,
+        // the longest delay this bank ever needs (every string is ≥ it). The
         // 1.5× factor over the raw period leaves headroom for the cascade
         // group delay; DelayLine then rounds the capacity up to the next
-        // power of two, so the effective margin is larger still (≈ 276 →
-        // 512 at 48 kHz). Much smaller than Voice's bass-friendly 20 Hz
-        // floor. NOTE: the sizing is tied to BASE_NOTE — lowering it (or
-        // adding strings below C4) requires this formula to follow.
+        // power of two. Deriving `lowest_freq` from `BASE_NOTE` keeps this
+        // self-consistent if the bank's range is ever changed.
         let lowest_freq = midi_to_hz(BASE_NOTE);
         let max_delay = (sample_rate * 1.5 / lowest_freq).ceil() as usize;
-        let mut strings: [KarplusStrong; N_STRINGS] = std::array::from_fn(|_| {
-            KarplusStrong::new(sample_rate, max_delay)
-        });
+        let mut strings: [KarplusStrong; N_STRINGS] =
+            std::array::from_fn(|_| KarplusStrong::new(sample_rate, max_delay));
         // Arm each string at its assigned note and start with damper engaged.
         for (i, s) in strings.iter_mut().enumerate() {
             let note = BASE_NOTE + i as u8;
