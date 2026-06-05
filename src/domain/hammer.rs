@@ -47,16 +47,16 @@ const VELOCITY_WARP: f32 = 1.5;
 
 /// Exponent applied to velocity for *amplitude* scaling.
 ///
-/// A controllable velocity-to-loudness response matters more than the
-/// physical kinetic-energy interpretation (`v²`). With higher exponents
-/// the slope steepens fastest exactly where players spend most time
-/// (mf–f, MIDI 60–100), so 5-unit velocity bumps produce 2–3 dB jumps
-/// that feel "twitchy". A linear amplitude curve (`v^1.0`) gives a
-/// per-velocity step closer to ~0.5 dB in that range; the *expressive*
-/// dynamic still comes through because the felt-compression LPF
-/// (`VELOCITY_WARP`) keeps shaping the spectrum with velocity, which
-/// the ear hears as an additional ≈ 6–8 dB of perceived loudness.
-const AMPLITUDE_WARP: f32 = 1.0;
+/// Real hammer kinetic energy scales as `v²`, giving a ~40 dB pp→ff range —
+/// the dynamic span that makes a piano expressive. A purely linear curve
+/// (`v^1.0`) collapses that to ~20 dB and the instrument feels dynamically
+/// flat. We compromise at `1.6`: ~32 dB of amplitude range (plus the
+/// felt-compression LPF's ≈ 6–8 dB of brightness-driven loudness ≈ a
+/// realistic ~38 dB span) while keeping the local slope gentle enough
+/// (~0.9 dB per 5-velocity step around mf) to avoid the "twitchy" feel
+/// that the steeper `v²` produces in the MIDI 60–100 zone where players
+/// spend most time.
+const AMPLITUDE_WARP: f32 = 1.6;
 
 #[derive(Debug)]
 pub struct Hammer {
@@ -185,7 +185,8 @@ mod tests {
 
     #[test]
     fn higher_velocity_has_more_total_energy() {
-        // Velocity² scaling means a 4× louder amplitude at v=1 vs v=0.5.
+        // AMPLITUDE_WARP = 1.6: v=1 vs v=0.5 is a 0.5^1.6 ≈ 3× amplitude
+        // ratio, widened further by the brighter felt LPF at high velocity.
         let mut hard = Hammer::new(48_000.0);
         hard.fire(1.0);
         let mut soft = Hammer::new(48_000.0);
