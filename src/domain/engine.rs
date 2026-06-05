@@ -73,7 +73,12 @@ impl Engine {
             ages: [0; MAX_VOICES],
             age_counter: 0,
             mono: false,
-            master_gain: 0.5,
+            // Lowered from 0.5 to leave headroom for polyphony: a single ff
+            // note now peaks ≈ 0.5 (not 0.76), so ordinary 2–3 note chords
+            // stay below the soft-clip knee and only genuinely dense ff
+            // clusters saturate — a real soundboard does not distort at mf.
+            // The lower nominal level is recovered downstream by system gain.
+            master_gain: 0.34,
             soundboard: Soundboard::new(sample_rate),
             sympathetic: Sympathetic::new(sample_rate),
             sustain_pedal_down: false,
@@ -250,23 +255,24 @@ impl Engine {
     }
 }
 
-/// Amplitude below which the output bus is passed through untouched. A
-/// single fortissimo note peaks at ≈ 0.76, so a lone note stays perfectly
-/// linear; the saturator only engages once *polyphony* sums past the
-/// headroom of one note. 0.7 leaves 0.3 of range for the soft knee to
-/// curve through before reaching ±1.
-const SOFT_CLIP_THRESHOLD: f32 = 0.7;
+/// Amplitude below which the output bus is passed through untouched. With
+/// `master_gain = 0.34` a single fortissimo note peaks ≈ 0.5 and even an
+/// ordinary mezzo-forte 3-note chord stays below this knee, so normal
+/// playing is perfectly linear; the saturator only engages on genuinely
+/// dense fortissimo clusters. 0.88 leaves 0.12 of range for the soft knee
+/// to curve through before reaching ±1.
+const SOFT_CLIP_THRESHOLD: f32 = 0.88;
 
 /// Soft-clip the output bus to ±1 with a tanh knee above
 /// [`SOFT_CLIP_THRESHOLD`].
 ///
 /// A hard clip (`clamp`) recovers from polyphonic overshoot by slicing the
 /// waveform flat at ±1. Those sharp corners inject broadband high-frequency
-/// harmonics — the audible "buzz"/"fart" a player hears when striking two or
-/// more notes hard at once (a 2-note ff chord peaks at ≈ 1.4, well past the
-/// rail). Replacing the corner with a smooth tanh knee removes the harsh
-/// harmonics: the bus still cannot exceed ±1, but it *approaches* the rail
-/// gradually, the way a real soundboard saturates under a fortissimo chord.
+/// harmonics — the audible "buzz"/"fart" a player hears when a dense
+/// fortissimo cluster sums well past the rail. Replacing the corner with a
+/// smooth tanh knee removes the harsh harmonics: the bus still cannot exceed
+/// ±1, but it *approaches* the rail gradually, the way a real soundboard
+/// saturates under a fortissimo chord.
 ///
 /// Below the threshold the signal is untouched (unity gain, no colour). Above
 /// it, the excess is compressed through `tanh`, which is C¹-continuous at the
@@ -540,19 +546,20 @@ mod tests {
     }
 
     #[test]
-    fn hard_chord_no_longer_hard_clips() {
-        // Two notes struck at max velocity overshoot the rail (pre-clip
-        // peak ≈ 1.4). The old hard clip pinned long flat runs at exactly
-        // ±1.0 — the corners that buzz. The soft knee must leave the peak
-        // strictly *below* 1.0, proving the signal approaches the rail
-        // instead of slamming into it.
+    fn ff_chord_enters_soft_knee_below_rail() {
+        // After the lowered master_gain, a two-note fortissimo chord just
+        // reaches into the soft knee (peak ≈ 0.94): above the 0.88 threshold
+        // yet strictly below the ±1 rail. This proves the bus *approaches*
+        // the rail gradually through the tanh knee instead of being pinned
+        // flat by a hard clip — while ordinary mf playing stays fully linear
+        // thanks to the new headroom.
         let mut eng = Engine::new(48_000.0);
         eng.handle_event(MidiEvent::note_on(60, 127));
         eng.handle_event(MidiEvent::note_on(64, 127));
         let mut buf = vec![0.0; 9_600]; // 200 ms
         eng.render(&mut buf);
         let peak = buf.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
-        assert!(peak > 0.9, "chord should still be loud: {peak}");
+        assert!(peak > 0.88, "ff chord should reach into the knee: {peak}");
         assert!(peak < 1.0, "soft knee should stay below the rail: {peak}");
     }
 }
