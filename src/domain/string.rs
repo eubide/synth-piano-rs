@@ -287,10 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn high_note_falls_back_to_zero_dispersion() {
-        // C8 — its short loop can't accommodate any dispersion, so the
-        // cascade collapses to N pure sample delays. The KS algorithm
-        // should still produce a stable, audible signal.
+    fn high_note_stays_stable_with_tapered_dispersion() {
+        // C8 — its short loop can only hold reduced dispersion, so |a| tapers
+        // down (but stays non-zero, keeping the treble inharmonic). The KS
+        // loop must still produce a stable, audible, finite signal.
         let mut s = KarplusStrong::new(48_000.0, 4096);
         s.pluck(4_186.0);
         let buf = render_impulse_response(&mut s, 2_048);

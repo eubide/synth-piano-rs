@@ -17,13 +17,15 @@
 //!
 //! ## Coefficient strategy
 //! Stronger dispersion (larger `|a|`) means more inharmonicity, but also a
-//! larger DC group delay we have to subtract from the delay line. For
-//! short loops (high notes) the cascade can eat the whole budget. We adapt
-//! `|a|` so the cascade contributes a target *fraction* of the loop
-//! period (currently 5 %), clamped so per-stage delay stays in `[1, ∞)`
-//! and overall `|a| ≤ 0.5`. Notes whose loops are too short for any
-//! dispersion fall back to `a = 0` (the cascade degenerates to `N` pure
-//! sample delays — no inharmonicity, just length).
+//! larger DC group delay we have to subtract from the delay line. We aim for
+//! a *fixed* strong coefficient (`|a| = 0.5`) across the whole keyboard and
+//! back it off only in the extreme treble, where the loop is too short to
+//! hold the cascade's group delay. Holding `|a|` constant while the loop
+//! period shrinks makes the cascade's group delay a growing *fraction* of
+//! the loop toward the treble, so the relative partial stretch — the audible
+//! inharmonicity — rises with pitch, matching real strings (B grows with
+//! note number). Only the very top (≳ C8) tapers `|a|` down; nothing in the
+//! played range collapses to a flat, inharmonicity-free `a = 0`.
 
 use crate::domain::filter::AllpassFirstOrder;
 
@@ -31,8 +33,21 @@ use crate::domain::filter::AllpassFirstOrder;
 /// stronger dispersion at a given per-stage `|a|`, at modest CPU cost.
 pub const CASCADE_STAGES: usize = 4;
 
-/// Target cascade DC group delay as a fraction of the loop period.
-const TARGET_FRACTION_OF_LOOP: f32 = 0.05;
+/// Desired per-stage DC group delay, in samples. `(1+|a|)/(1−|a|) = 3`
+/// gives `|a| = 0.5` — a strong, fixed dispersion strength. Keeping the
+/// *coefficient* roughly constant across the keyboard (rather than a fixed
+/// fraction of each loop) is what makes inharmonicity grow with pitch: the
+/// cascade's group delay stays ~constant in samples while the loop period
+/// shrinks, so the *relative* partial stretch rises toward the treble —
+/// exactly the physics (B increases with note number; Fletcher & Rossing).
+const TARGET_PER_STAGE_DELAY: f32 = 3.0;
+
+/// Fraction of the (usable) loop period the cascade's group delay may
+/// consume. The remainder feeds the delay line, which must stay ≥ 2 samples.
+/// Only binds in the extreme treble, where the loop is too short to hold the
+/// full target — there `|a|` tapers down gracefully instead of collapsing to
+/// zero (the old behaviour, which left the treble with no inharmonicity).
+const MAX_CASCADE_FRACTION: f32 = 0.6;
 
 /// Hard cap on `|a|` so the cascade never dominates the loop dynamics.
 const MAX_ABS_COEFFICIENT: f32 = 0.5;
@@ -88,16 +103,19 @@ impl DispersionCascade {
     /// stages. Falls back to `0.0` when no dispersion fits.
     pub fn fit_to_frequency(&mut self, freq: f32, sample_rate: f32) {
         let loop_period = sample_rate / freq;
-        let target_total_delay = loop_period * TARGET_FRACTION_OF_LOOP;
-        let target_per_stage = target_total_delay / CASCADE_STAGES as f32;
-        let a = if target_per_stage <= 1.0 {
-            // Degenerate: the loop is too short for any dispersion. Use a=0,
-            // which makes each stage a 1-sample delay. The cascade contributes
-            // exactly N samples of constant delay (no inharmonicity).
+        // Group delay the cascade may consume, leaving the delay line its
+        // ≥ 2 samples plus the LPF's ½. Only the extreme treble is tight.
+        let budget = ((loop_period - 2.5) * MAX_CASCADE_FRACTION).max(0.0);
+        let max_per_stage = budget / CASCADE_STAGES as f32;
+        // Aim for the fixed target strength, backing off only when the loop
+        // cannot hold it. Constant target → inharmonicity grows with pitch.
+        let per_stage = max_per_stage.min(TARGET_PER_STAGE_DELAY);
+        let a = if per_stage <= 1.0 {
+            // Loop too short for even a 1-sample stage delay: no dispersion.
             0.0
         } else {
-            // Solve τ_g(0) = (1+|a|)/(1−|a|) = target_per_stage for |a|.
-            let mag = (target_per_stage - 1.0) / (target_per_stage + 1.0);
+            // Solve τ_g(0) = (1+|a|)/(1−|a|) = per_stage for |a|.
+            let mag = (per_stage - 1.0) / (per_stage + 1.0);
             -mag.min(MAX_ABS_COEFFICIENT)
         };
         self.set_coefficient(a);
@@ -166,28 +184,36 @@ mod tests {
     }
 
     #[test]
-    fn fit_falls_back_to_zero_for_high_notes() {
-        // C8 (4186 Hz) at 48 kHz: loop period 11.5; 5% = 0.575 samples;
-        // per stage = 0.144 — well below the τ_g(0) ≥ 1 floor.
+    fn fit_keeps_treble_dispersive_but_bounded() {
+        // C8 (4186 Hz) at 48 kHz: loop period ≈ 11.5. The cascade can no
+        // longer hold the full target, so |a| tapers down — but it must NOT
+        // collapse to 0 (the old behaviour that left the treble harmonic).
         let mut c = DispersionCascade::new();
         c.fit_to_frequency(4_186.0, 48_000.0);
-        assert_eq!(c.coefficient(), 0.0);
+        let a = c.coefficient();
+        assert!(
+            a < 0.0 && a > -MAX_ABS_COEFFICIENT,
+            "treble should stay dispersive but below the cap: a={a}"
+        );
     }
 
     #[test]
-    fn fit_picks_negative_coefficient_for_low_notes() {
-        // A4 (440 Hz) at 48 kHz: loop period 109; 5% = 5.45 samples;
-        // per stage = 1.36 → a < 0 chosen.
+    fn fit_picks_full_strength_for_mid_notes() {
+        // A4 (440 Hz): the loop has ample room, so |a| reaches the target
+        // strength (the cap MAX_ABS_COEFFICIENT).
         let mut c = DispersionCascade::new();
         c.fit_to_frequency(440.0, 48_000.0);
         let a = c.coefficient();
-        assert!(a < 0.0 && a >= -MAX_ABS_COEFFICIENT, "got a={a}");
+        assert!(
+            (a + MAX_ABS_COEFFICIENT).abs() < 1e-4,
+            "mid note should hit the target strength: a={a}"
+        );
     }
 
     #[test]
     fn fit_caps_coefficient_for_very_long_loops() {
-        // A0 (27.5 Hz): loop period 1745; 5% = 87; per stage = 21.8 →
-        // ideal |a| ≈ 0.91, but we cap at MAX_ABS_COEFFICIENT.
+        // A0 (27.5 Hz): loop period 1745, far more room than the target
+        // needs → |a| pinned at the cap MAX_ABS_COEFFICIENT.
         let mut c = DispersionCascade::new();
         c.fit_to_frequency(27.5, 48_000.0);
         assert!((c.coefficient() + MAX_ABS_COEFFICIENT).abs() < 1e-4);
