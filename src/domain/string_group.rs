@@ -35,19 +35,19 @@ pub const MAX_STRINGS_PER_NOTE: usize = 3;
 /// total. Detune values were picked by ear for warmth without sounding
 /// detuned: ±0.7 cent for doubles, ±1 cent for triples.
 const DETUNE_CENTS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
-    [0.0, 0.0, 0.0],   // n=0 (safe default, never used in practice)
-    [0.0, 0.0, 0.0],   // n=1: single string, no detune
-    [-0.7, 0.7, 0.0],  // n=2: doubles, symmetric ±0.7 cent
-    [-1.0, 0.0, 1.0],  // n=3: triples, centre + ±1 cent
+    [0.0, 0.0, 0.0],  // n=0 (safe default, never used in practice)
+    [0.0, 0.0, 0.0],  // n=1: single string, no detune
+    [-0.7, 0.7, 0.0], // n=2: doubles, symmetric ±0.7 cent
+    [-1.0, 0.0, 1.0], // n=3: triples, centre + ±1 cent
 ];
 
 /// `1/√N` normalisation factors, indexed by `active_count`. Pre-computed
 /// to keep the audio path free of square roots.
 const STRING_NORM_FACTOR: [f32; MAX_STRINGS_PER_NOTE + 1] = [
-    0.0,            // n=0 (silent)
-    1.0,            // 1/√1
-    0.707_106_77,   // 1/√2
-    0.577_350_30,   // 1/√3
+    0.0,          // n=0 (silent)
+    1.0,          // 1/√1
+    0.707_106_77, // 1/√2
+    0.577_350_30, // 1/√3
 ];
 
 /// Map a MIDI note to its string count. Crossovers chosen to match the
@@ -81,6 +81,17 @@ impl StringGroup {
 
     pub fn active_count(&self) -> usize {
         self.active_count
+    }
+
+    /// Set the per-cycle loop loss on every string in the group. The voice
+    /// uses this to give each note a pitch-dependent decay rate: without it
+    /// the only loss is the loop LPF, which barely touches the fundamental
+    /// of bass/mid notes (they would ring almost forever). See
+    /// [`crate::domain::voice`] for the T60 → loop-gain mapping.
+    pub fn set_loop_gain(&mut self, gain: f32) {
+        for s in &mut self.strings {
+            s.set_loop_gain(gain);
+        }
     }
 
     /// Any string still ringing → the group is active.
