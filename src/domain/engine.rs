@@ -3,7 +3,7 @@
 //!
 //! ## Signal path
 //! ```text
-//!                                  ┌── × master_gain ── clip ── output
+//!                                  ┌── × master_gain ── soft-clip ── output
 //!                                  │
 //!   voices.sum() ──┬──────────────┬┴─── soundboard ───┘
 //!                  │              │
@@ -250,11 +250,36 @@ impl Engine {
     }
 }
 
-/// Hard-clip to ±1. Cheap and good enough as a safety net for the rare
-/// extreme-chord case.
+/// Amplitude below which the output bus is passed through untouched. A
+/// single fortissimo note peaks at ≈ 0.76, so a lone note stays perfectly
+/// linear; the saturator only engages once *polyphony* sums past the
+/// headroom of one note. 0.7 leaves 0.3 of range for the soft knee to
+/// curve through before reaching ±1.
+const SOFT_CLIP_THRESHOLD: f32 = 0.7;
+
+/// Soft-clip the output bus to ±1 with a tanh knee above
+/// [`SOFT_CLIP_THRESHOLD`].
+///
+/// A hard clip (`clamp`) recovers from polyphonic overshoot by slicing the
+/// waveform flat at ±1. Those sharp corners inject broadband high-frequency
+/// harmonics — the audible "buzz"/"fart" a player hears when striking two or
+/// more notes hard at once (a 2-note ff chord peaks at ≈ 1.4, well past the
+/// rail). Replacing the corner with a smooth tanh knee removes the harsh
+/// harmonics: the bus still cannot exceed ±1, but it *approaches* the rail
+/// gradually, the way a real soundboard saturates under a fortissimo chord.
+///
+/// Below the threshold the signal is untouched (unity gain, no colour). Above
+/// it, the excess is compressed through `tanh`, which is C¹-continuous at the
+/// knee (matching slope) so the transition itself adds no distortion.
 #[inline]
 fn clip(x: f32) -> f32 {
-    x.clamp(-1.0, 1.0)
+    let a = x.abs();
+    if a <= SOFT_CLIP_THRESHOLD {
+        return x;
+    }
+    let t = SOFT_CLIP_THRESHOLD;
+    let knee = ((a - t) / (1.0 - t)).tanh();
+    x.signum() * (t + (1.0 - t) * knee)
 }
 
 #[cfg(test)]
@@ -475,5 +500,59 @@ mod tests {
             down > up * 2.0,
             "pedal down should leave more residual ring: down={down} up={up}"
         );
+    }
+
+    // ─── Soft-clip / saturation tests ─────────────────────────────────
+
+    #[test]
+    fn soft_clip_is_transparent_below_threshold() {
+        // A lone fortissimo note peaks at ≈ 0.76; everything up to the
+        // knee must pass through bit-for-bit so single notes keep their
+        // exact timbre.
+        for &x in &[0.0, 0.1, 0.5, SOFT_CLIP_THRESHOLD] {
+            assert_eq!(clip(x), x);
+            assert_eq!(clip(-x), -x);
+        }
+    }
+
+    #[test]
+    fn soft_clip_never_exceeds_unity() {
+        // No matter how dense the chord (a 5-note bass ff cluster peaks
+        // at ≈ 3.3), the bus must stay inside ±1 — the safety-net role.
+        for i in 0..2_000 {
+            let x = i as f32 * 0.01; // 0 .. 20
+            assert!(clip(x) <= 1.0, "clip({x}) = {} exceeded 1.0", clip(x));
+            assert!(clip(-x) >= -1.0, "clip({}) underflowed -1.0", -x);
+        }
+    }
+
+    #[test]
+    fn soft_clip_is_monotonic_and_odd() {
+        // Monotonic → no fold-back artefacts; odd → no DC bias added.
+        let mut prev = clip(0.0);
+        for i in 1..2_000 {
+            let x = i as f32 * 0.005;
+            let y = clip(x);
+            assert!(y >= prev, "non-monotonic at x={x}: {y} < {prev}");
+            assert!((clip(-x) + y).abs() < 1e-6, "not odd at x={x}");
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn hard_chord_no_longer_hard_clips() {
+        // Two notes struck at max velocity overshoot the rail (pre-clip
+        // peak ≈ 1.4). The old hard clip pinned long flat runs at exactly
+        // ±1.0 — the corners that buzz. The soft knee must leave the peak
+        // strictly *below* 1.0, proving the signal approaches the rail
+        // instead of slamming into it.
+        let mut eng = Engine::new(48_000.0);
+        eng.handle_event(MidiEvent::note_on(60, 127));
+        eng.handle_event(MidiEvent::note_on(64, 127));
+        let mut buf = vec![0.0; 9_600]; // 200 ms
+        eng.render(&mut buf);
+        let peak = buf.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        assert!(peak > 0.9, "chord should still be loud: {peak}");
+        assert!(peak < 1.0, "soft knee should stay below the rail: {peak}");
     }
 }
