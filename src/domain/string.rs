@@ -298,4 +298,44 @@ mod tests {
         assert!(energy > 0.0, "no signal at C8");
         assert!(energy.is_finite(), "C8 loop diverged");
     }
+
+    #[test]
+    fn bass_partials_are_stretched_not_harmonic() {
+        // The bass must be inharmonic: a perfectly harmonic bass sounds
+        // synthetic/organ-like. Measure the 12th partial of C2 — it should
+        // sit clearly above 12·f0 (real grands stretch it tens of cents).
+        // Goertzel magnitude at f over the buffer.
+        fn goertzel(buf: &[f32], f: f32, sr: f32) -> f32 {
+            let w = std::f32::consts::TAU * f / sr;
+            let coeff = 2.0 * w.cos();
+            let (mut q1, mut q2) = (0.0f32, 0.0f32);
+            for &x in buf {
+                let q0 = coeff * q1 - q2 + x;
+                q2 = q1;
+                q1 = q0;
+            }
+            (q1 * q1 + q2 * q2 - coeff * q1 * q2).sqrt()
+        }
+        let sr = 48_000.0;
+        let f0 = 65.406; // C2
+        let mut s = KarplusStrong::new(sr, 4096);
+        s.pluck(f0);
+        let buf = render_impulse_response(&mut s, 32_768);
+        // Scan ±4% around the 12th harmonic for the actual partial peak.
+        let center = 12.0 * f0;
+        let (mut best_f, mut best_m) = (center, 0.0f32);
+        for i in 0..=240 {
+            let f = center * (0.97 + 0.06 * i as f32 / 240.0);
+            let m = goertzel(&buf, f, sr);
+            if m > best_m {
+                best_m = m;
+                best_f = f;
+            }
+        }
+        let cents = 1200.0 * (best_f / center).log2();
+        assert!(
+            cents > 5.0,
+            "C2 12th partial should be stretched sharp (inharmonic), got {cents:.1} cents"
+        );
+    }
 }

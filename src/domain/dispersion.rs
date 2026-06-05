@@ -17,15 +17,23 @@
 //!
 //! ## Coefficient strategy
 //! Stronger dispersion (larger `|a|`) means more inharmonicity, but also a
-//! larger DC group delay we have to subtract from the delay line. We aim for
-//! a *fixed* strong coefficient (`|a| = 0.5`) across the whole keyboard and
-//! back it off only in the extreme treble, where the loop is too short to
-//! hold the cascade's group delay. Holding `|a|` constant while the loop
-//! period shrinks makes the cascade's group delay a growing *fraction* of
-//! the loop toward the treble, so the relative partial stretch — the audible
-//! inharmonicity — rises with pitch, matching real strings (B grows with
-//! note number). Only the very top (≳ C8) tapers `|a|` down; nothing in the
-//! played range collapses to a flat, inharmonicity-free `a = 0`.
+//! larger DC group delay we have to subtract from the delay line. Real piano
+//! inharmonicity is **U-shaped** (Railsback): large in the treble (short
+//! stiff strings) AND in the bass (thick wound strings), with a minimum in
+//! the middle. We reproduce both arms of the U:
+//! - A fixed per-stage floor (`|a| = 0.5`) keeps the **treble** dispersive:
+//!   its group delay stays ~constant while the loop shrinks, so the relative
+//!   partial stretch rises toward the top (it only tapers in the extreme
+//!   treble where the short loop can't hold it — never collapsing to a flat
+//!   `a = 0`).
+//! - A bass-proportional target ([`BASS_INHARM_FRACTION`] of the loop period)
+//!   gives the long **bass** loops a large absolute group delay, so their
+//!   upper partials stretch too (≈ +25 cents at the 16th partial of C2)
+//!   instead of staying harmonic — which is what made the bass sound
+//!   synthetic/organ-like.
+//!
+//! The cascade uses whichever target is larger, so the middle register sits
+//! at the floor (the minimum of the U) and both extremes climb.
 
 use crate::domain::filter::AllpassFirstOrder;
 
@@ -33,14 +41,21 @@ use crate::domain::filter::AllpassFirstOrder;
 /// stronger dispersion at a given per-stage `|a|`, at modest CPU cost.
 pub const CASCADE_STAGES: usize = 4;
 
-/// Desired per-stage DC group delay, in samples. `(1+|a|)/(1−|a|) = 3`
-/// gives `|a| = 0.5` — a strong, fixed dispersion strength. Keeping the
-/// *coefficient* roughly constant across the keyboard (rather than a fixed
-/// fraction of each loop) is what makes inharmonicity grow with pitch: the
-/// cascade's group delay stays ~constant in samples while the loop period
-/// shrinks, so the *relative* partial stretch rises toward the treble —
-/// exactly the physics (B increases with note number; Fletcher & Rossing).
+/// Floor on the per-stage DC group delay, in samples. `(1+|a|)/(1−|a|) = 3`
+/// gives `|a| = 0.5`. This fixed component keeps the mid/treble dispersive
+/// (its group delay stays ~constant while the loop shrinks, so relative
+/// stretch rises toward the treble).
 const TARGET_PER_STAGE_DELAY: f32 = 3.0;
+
+/// Real piano inharmonicity is a *U-shaped* curve (Railsback): it is large in
+/// the treble (short stiff strings) AND in the bass (thick wound strings),
+/// with a minimum in the middle. The fixed [`TARGET_PER_STAGE_DELAY`] alone
+/// rises monotonically toward the treble and leaves the bass nearly harmonic
+/// — which sounds synthetic/organ-like. We add a second target proportional
+/// to the loop period so the long bass loops also get a large absolute group
+/// delay (≈ `BASS_INHARM_FRACTION` of the period), restoring the left arm of
+/// the U. The cascade uses whichever target is larger.
+const BASS_INHARM_FRACTION: f32 = 0.075;
 
 /// Fraction of the (usable) loop period the cascade's group delay may
 /// consume. The remainder feeds the delay line, which must stay ≥ 2 samples.
@@ -49,8 +64,11 @@ const TARGET_PER_STAGE_DELAY: f32 = 3.0;
 /// zero (the old behaviour, which left the treble with no inharmonicity).
 const MAX_CASCADE_FRACTION: f32 = 0.6;
 
-/// Hard cap on `|a|` so the cascade never dominates the loop dynamics.
-const MAX_ABS_COEFFICIENT: f32 = 0.5;
+/// Hard cap on `|a|`. The cascade is an allpass (unity magnitude), so a
+/// large `|a|` cannot destabilise the loop — it only deepens the bass
+/// dispersion. Raised to 0.9 to let the long bass loops reach the strong
+/// stretch their target asks for.
+const MAX_ABS_COEFFICIENT: f32 = 0.9;
 
 #[derive(Debug)]
 pub struct DispersionCascade {
@@ -107,9 +125,12 @@ impl DispersionCascade {
         // ≥ 2 samples plus the LPF's ½. Only the extreme treble is tight.
         let budget = ((loop_period - 2.5) * MAX_CASCADE_FRACTION).max(0.0);
         let max_per_stage = budget / CASCADE_STAGES as f32;
-        // Aim for the fixed target strength, backing off only when the loop
-        // cannot hold it. Constant target → inharmonicity grows with pitch.
-        let per_stage = max_per_stage.min(TARGET_PER_STAGE_DELAY);
+        // Target = the larger of the fixed mid/treble floor and a
+        // bass-proportional component (U-shaped Railsback curve), then capped
+        // by what the loop can physically hold (binds only in the top treble).
+        let bass_target = loop_period * BASS_INHARM_FRACTION / CASCADE_STAGES as f32;
+        let target = bass_target.max(TARGET_PER_STAGE_DELAY);
+        let per_stage = max_per_stage.min(target);
         let a = if per_stage <= 1.0 {
             // Loop too short for even a 1-sample stage delay: no dispersion.
             0.0
@@ -198,24 +219,42 @@ mod tests {
     }
 
     #[test]
-    fn fit_picks_full_strength_for_mid_notes() {
-        // A4 (440 Hz): the loop has ample room, so |a| reaches the target
-        // strength (the cap MAX_ABS_COEFFICIENT).
+    fn fit_rests_at_the_floor_for_mid_notes() {
+        // A4 (440 Hz) sits at the minimum of the U: the bass-proportional
+        // target is tiny here, so |a| falls back to the fixed floor (0.5).
         let mut c = DispersionCascade::new();
         c.fit_to_frequency(440.0, 48_000.0);
         let a = c.coefficient();
         assert!(
-            (a + MAX_ABS_COEFFICIENT).abs() < 1e-4,
-            "mid note should hit the target strength: a={a}"
+            (a + 0.5).abs() < 0.05,
+            "mid note should sit at the floor: a={a}"
         );
     }
 
     #[test]
     fn fit_caps_coefficient_for_very_long_loops() {
-        // A0 (27.5 Hz): loop period 1745, far more room than the target
-        // needs → |a| pinned at the cap MAX_ABS_COEFFICIENT.
+        // A0 (27.5 Hz): the bass-proportional target is huge here, so |a|
+        // pins at the cap MAX_ABS_COEFFICIENT.
         let mut c = DispersionCascade::new();
         c.fit_to_frequency(27.5, 48_000.0);
         assert!((c.coefficient() + MAX_ABS_COEFFICIENT).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dispersion_is_stronger_in_bass_than_mid() {
+        // The U-shaped curve: bass loops get a far stronger coefficient than
+        // the mid-register minimum, so the bass partials actually stretch
+        // (without it the bass is near-harmonic and sounds synthetic).
+        let coeff = |f: f32| {
+            let mut c = DispersionCascade::new();
+            c.fit_to_frequency(f, 48_000.0);
+            c.coefficient().abs()
+        };
+        let bass = coeff(65.41); // C2
+        let mid = coeff(440.0); // A4
+        assert!(
+            bass > mid + 0.2,
+            "bass should be markedly more dispersive than mid: bass={bass} mid={mid}"
+        );
     }
 }
