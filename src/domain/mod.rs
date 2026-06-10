@@ -10,6 +10,7 @@ pub mod hammer;
 pub mod midi_event;
 pub mod rng;
 pub mod soundboard;
+pub mod strike_comb;
 pub mod string;
 pub mod string_group;
 pub mod sympathetic;
