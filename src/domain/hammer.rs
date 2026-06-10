@@ -1,10 +1,12 @@
 //! Velocity-dependent hammer excitation.
 //!
 //! ## Model
-//! A raised-cosine pulse (1.5 ms) shaped by a one-pole lowpass whose cutoff
-//! frequency rises with velocity. The pulse is the *force profile* of the
-//! hammer striking the string; the LPF approximates the *felt compression*
-//! that smooths that force on a soft hit and sharpens it on a hard hit.
+//! A raised-cosine pulse whose duration depends on the struck note (long in
+//! the bass, sub-millisecond in the treble), shaped by a one-pole lowpass
+//! whose cutoff frequency rises with velocity. The pulse is the *force
+//! profile* of the hammer striking the string; the LPF approximates the
+//! *felt compression* that smooths that force on a soft hit and sharpens it
+//! on a hard hit.
 //!
 //! ## Why velocity → cutoff
 //! Real piano felt is non-linear:
@@ -26,16 +28,37 @@ use std::f32::consts::TAU;
 
 use crate::domain::filter::OnePoleLowpass;
 
-/// Hammer-string contact duration in seconds. Real grand-piano contact time
-/// ranges 1–4 ms. We pick a midpoint and keep it velocity-independent — the
-/// LPF supplies the velocity-dependent spectrum tilt.
-const PULSE_SECS: f32 = 0.0015;
+/// Hammer-string contact duration bounds, in seconds. Askenfelt & Jansson
+/// measured roughly 4 ms (bass) down to under 1 ms (treble) on real grands:
+/// the heavy, soft bass hammers press into thick wound strings far longer
+/// than the light, hard treble hammers. The duration sets the excitation
+/// bandwidth (raised-cosine main lobe ends at `2/T`), so this taper is what
+/// gives the bass its round "thump" *and* lets the treble actually energise
+/// its own fundamental — a fixed 1.5 ms pulse has almost no spectrum left
+/// at C7's 2.1 kHz, leaving the top octaves attack-only. Contact time is
+/// kept velocity-independent — the LPF supplies the velocity tilt.
+const CONTACT_SECS_BASS: f32 = 0.0035; // at A0, 27.5 Hz
+const CONTACT_SECS_TREBLE: f32 = 0.0004; // at C8, 4186 Hz
+/// Frequency anchors for the contact-time taper (A0 and C8 fundamentals).
+const CONTACT_REF_BASS_HZ: f32 = 27.5;
+const CONTACT_REF_TREBLE_HZ: f32 = 4_186.0;
+
+/// Contact duration for a note with fundamental `freq`, interpolated
+/// geometrically in log-frequency between the A0 and C8 anchors (string
+/// scaling is itself roughly geometric across the compass).
+fn contact_secs(freq: f32) -> f32 {
+    let t = ((freq / CONTACT_REF_BASS_HZ).ln()
+        / (CONTACT_REF_TREBLE_HZ / CONTACT_REF_BASS_HZ).ln())
+    .clamp(0.0, 1.0);
+    CONTACT_SECS_BASS * (CONTACT_SECS_TREBLE / CONTACT_SECS_BASS).powf(t)
+}
 
 /// Cutoff bounds for the felt-compression LPF, in Hz.
 ///
 /// Why these numbers: the raised-cosine pulse has its main spectral lobe up
-/// to ~1/PULSE_SECS ≈ 670 Hz. The LPF only contributes audible filtering
-/// when the cutoff sits *below* that. We pick:
+/// to ~1/contact_secs (≈ 285 Hz in the bass, ≈ 2.5 kHz in the treble). The
+/// LPF only contributes audible filtering when the cutoff sits *below* the
+/// pulse bandwidth. We pick:
 /// - 300 Hz at v=0 → cutoff well below pulse bandwidth → noticeably muffled.
 /// - 7 kHz at v=1 → cutoff well above pulse bandwidth → nearly transparent.
 const CUTOFF_MIN_HZ: f32 = 300.0;
@@ -76,7 +99,8 @@ impl Hammer {
         Self {
             sample_rate,
             lpf: OnePoleLowpass::new(),
-            pulse_len: (PULSE_SECS * sample_rate) as usize,
+            // Placeholder; `fire` recomputes it from the struck note.
+            pulse_len: (CONTACT_SECS_TREBLE * sample_rate) as usize,
             pulse_pos: 0,
             velocity: 0.0,
             cutoff_hz: CUTOFF_MIN_HZ,
@@ -90,11 +114,19 @@ impl Hammer {
         self.cutoff_hz
     }
 
-    /// Trigger a strike. `velocity` is the normalised MIDI velocity in [0, 1].
-    pub fn fire(&mut self, velocity: f32) {
+    /// Pulse length currently programmed, in samples. For tests and metering.
+    pub fn pulse_len(&self) -> usize {
+        self.pulse_len
+    }
+
+    /// Trigger a strike. `velocity` is the normalised MIDI velocity in
+    /// [0, 1]; `freq` is the struck note's fundamental in Hz, which sets
+    /// the register-dependent contact duration.
+    pub fn fire(&mut self, velocity: f32, freq: f32) {
         let v = velocity.clamp(0.0, 1.0);
         self.velocity = v;
         self.pulse_pos = 0;
+        self.pulse_len = ((contact_secs(freq) * self.sample_rate) as usize).max(2);
         self.lpf.reset();
         let warp = v.powf(VELOCITY_WARP);
         let cutoff = CUTOFF_MIN_HZ + (CUTOFF_MAX_HZ - CUTOFF_MIN_HZ) * warp;
@@ -161,7 +193,7 @@ mod tests {
     #[test]
     fn velocity_zero_produces_silence() {
         let mut h = Hammer::new(48_000.0);
-        h.fire(0.0);
+        h.fire(0.0, 261.6);
         for _ in 0..1_000 {
             assert_eq!(h.tick(), 0.0);
         }
@@ -170,7 +202,7 @@ mod tests {
     #[test]
     fn fired_hammer_produces_signal_then_settles() {
         let mut h = Hammer::new(48_000.0);
-        h.fire(1.0);
+        h.fire(1.0, 261.6);
         let mut buf = vec![0.0; 2_048];
         for v in buf.iter_mut() {
             *v = h.tick();
@@ -188,9 +220,9 @@ mod tests {
         // AMPLITUDE_WARP = 1.6: v=1 vs v=0.5 is a 0.5^1.6 ≈ 3× amplitude
         // ratio, widened further by the brighter felt LPF at high velocity.
         let mut hard = Hammer::new(48_000.0);
-        hard.fire(1.0);
+        hard.fire(1.0, 261.6);
         let mut soft = Hammer::new(48_000.0);
-        soft.fire(0.5);
+        soft.fire(0.5, 261.6);
         let mut buf_h = vec![0.0; 1_024];
         let mut buf_s = vec![0.0; 1_024];
         for v in buf_h.iter_mut() {
@@ -200,6 +232,26 @@ mod tests {
             *v = soft.tick();
         }
         assert!(rms(&buf_h) > rms(&buf_s) * 2.0);
+    }
+
+    #[test]
+    fn contact_time_tapers_from_bass_to_treble() {
+        // A bass hammer presses into its string several times longer than a
+        // treble hammer — that taper is what rounds the bass attack and
+        // keeps the treble excitation wideband enough to reach its own
+        // fundamental.
+        let mut h = Hammer::new(48_000.0);
+        h.fire(1.0, 27.5); // A0
+        let bass_len = h.pulse_len();
+        h.fire(1.0, 4_186.0); // C8
+        let treble_len = h.pulse_len();
+        assert!(
+            bass_len > treble_len * 4,
+            "bass contact should be much longer: bass={bass_len} treble={treble_len}"
+        );
+        // Sanity: the anchors land where the constants say.
+        assert_eq!(bass_len, (CONTACT_SECS_BASS * 48_000.0) as usize);
+        assert_eq!(treble_len, (CONTACT_SECS_TREBLE * 48_000.0) as usize);
     }
 
     #[test]
@@ -213,15 +265,15 @@ mod tests {
         // Here we just verify the LPF cutoff is programmed correctly.
         let mut h = Hammer::new(48_000.0);
 
-        h.fire(0.0);
+        h.fire(0.0, 261.6);
         assert!((h.cutoff_hz() - CUTOFF_MIN_HZ).abs() < 1.0);
 
-        h.fire(1.0);
+        h.fire(1.0, 261.6);
         assert!((h.cutoff_hz() - CUTOFF_MAX_HZ).abs() < 1.0);
 
-        h.fire(0.25);
+        h.fire(0.25, 261.6);
         let c_quarter = h.cutoff_hz();
-        h.fire(0.75);
+        h.fire(0.75, 261.6);
         let c_three_quarter = h.cutoff_hz();
         assert!(
             c_three_quarter > c_quarter * 2.0,
