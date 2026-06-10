@@ -9,8 +9,8 @@
 //! characteristic "body", and adds a brief reverb-like tail.
 //!
 //! ## Model
-//! We approximate the plate with **16 bandpass biquads in parallel**,
-//! covering 89 Hz – 5.5 kHz with logarithmic-ish spacing. Each biquad is
+//! We approximate the plate with **18 bandpass biquads in parallel**,
+//! covering 50 Hz – 5.5 kHz with logarithmic-ish spacing. Each biquad is
 //! a second-order resonator — exactly the DSP equivalent of a mechanical
 //! mass-spring-damper. The 16 modes are not real measurements; they're a
 //! plausible distribution that produces audibly "wooden" coloration.
@@ -31,18 +31,26 @@
 
 use crate::domain::biquad::Biquad;
 
-/// Number of modes. 16 is the practical sweet-spot: enough to give
-/// audible "wood" coloration, few enough to stay below 200 ops/sample.
-pub const N_MODES: usize = 16;
+/// Number of modes. 18 keeps the audible "wood" coloration cheap while
+/// reaching low enough to support the bass register.
+pub const N_MODES: usize = 18;
 
 /// Mode table: `(frequency_hz, Q, mode_gain)`. Frequencies are roughly
 /// log-spaced with slight irregularity (real modal densities have no
 /// equal-tempered structure). Q values taper from 32 in the low body
 /// (where ringing is desired) to 12 at the top (where modes should
 /// blend into a smooth spectral shape).
+///
+/// The bottom two modes (50, 66 Hz) match the fundamental plate modes of a
+/// real grand soundboard (Suzuki 1986 measures the lowest at ≈ 50 Hz, with
+/// the highest mobility of the whole plate). Without them every fundamental
+/// below ~F2 reached the listener through the dry path alone — no "bloom" —
+/// which left the bass register sounding disembodied next to the mids.
 const MODES: [(f32, f32, f32); N_MODES] = [
-    (89.0, 20.0, 0.70),
-    (146.0, 22.0, 0.80),
+    (50.0, 15.0, 0.75),
+    (66.0, 18.0, 0.85),
+    (89.0, 20.0, 0.85),
+    (146.0, 22.0, 0.90),
     (200.0, 26.0, 0.90),
     (270.0, 30.0, 1.00),
     (360.0, 32.0, 0.95),
@@ -136,7 +144,10 @@ mod tests {
         for _ in 0..50_000 {
             y = sb.tick(1.0);
         }
-        assert!((y - DRY_GAIN).abs() < 1e-2, "settled to {y}, expected ~{DRY_GAIN}");
+        assert!(
+            (y - DRY_GAIN).abs() < 1e-2,
+            "settled to {y}, expected ~{DRY_GAIN}"
+        );
     }
 
     #[test]
@@ -156,6 +167,37 @@ mod tests {
             }
         }
         assert!(peak_tail < 1e-3, "tail did not decay: peak={peak_tail}");
+    }
+
+    #[test]
+    fn bass_fundamentals_get_wet_support() {
+        use std::f32::consts::TAU;
+
+        // A2 (110 Hz) sits between the 89 and 146 Hz modes; A0's strongest
+        // low partials land near the 50/66 Hz pair. Both must come out ABOVE
+        // the dry-only level (0.7) — i.e. the plate adds energy down there
+        // instead of leaving the bass to the dry path alone.
+        fn steady_rms(freq_hz: f32) -> f32 {
+            let mut sb = Soundboard::new(48_000.0);
+            let omega = TAU * freq_hz / 48_000.0;
+            let n = 48_000usize;
+            let mut sq = 0.0;
+            for i in 0..n {
+                let y = sb.tick((omega * i as f32).sin());
+                if i > 24_000 {
+                    sq += y * y;
+                }
+            }
+            (sq / (n - 24_000) as f32).sqrt()
+        }
+        let dry_only = DRY_GAIN / 2.0_f32.sqrt();
+        for f in [55.0, 66.0, 110.0] {
+            let rms = steady_rms(f);
+            assert!(
+                rms > dry_only,
+                "bass at {f} Hz should get wet support: rms={rms}, dry-only={dry_only}"
+            );
+        }
     }
 
     #[test]
