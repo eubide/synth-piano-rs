@@ -73,12 +73,14 @@ impl Engine {
             ages: [0; MAX_VOICES],
             age_counter: 0,
             mono: false,
-            // Lowered from 0.5 to leave headroom for polyphony: a single ff
-            // note now peaks ≈ 0.5 (not 0.76), so ordinary 2–3 note chords
-            // stay below the soft-clip knee and only genuinely dense ff
-            // clusters saturate — a real soundboard does not distort at mf.
-            // The lower nominal level is recovered downstream by system gain.
-            master_gain: 0.34,
+            // Calibrated so a single ff note peaks ≈ 0.5 and a two-note ff
+            // chord just reaches into the soft-clip knee, while ordinary
+            // 2–3 note mf chords stay fully linear — a real soundboard does
+            // not distort at mf. Nudged up from 0.34 when the strike comb
+            // removed the DC pedestal the unipolar hammer pulse used to
+            // park in every loop (that inaudible offset was inflating peak
+            // readings and stealing clip headroom).
+            master_gain: 0.38,
             soundboard: Soundboard::new(sample_rate),
             sympathetic: Sympathetic::new(sample_rate),
             sustain_pedal_down: false,
@@ -294,7 +296,7 @@ mod tests {
 
     /// Drain length used by "eventually silences" assertions. Needs to
     /// cover the longest tail in the engine: the soundboard's lowest
-    /// mode at Q=20, f=89 Hz has τ ≈ 71 ms. We allow ~30 τ for full
+    /// mode at Q=15, f=50 Hz has τ ≈ 95 ms. We allow ~20 τ for full
     /// quietness — call it 2 seconds at 48 kHz.
     const SILENCE_TAIL_SAMPLES: usize = 96_000;
     /// −80 dB amplitude — well below anything audible.

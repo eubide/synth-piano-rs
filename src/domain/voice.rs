@@ -2,8 +2,11 @@
 //! a damper envelope.
 //!
 //! ## Signal path
-//! `Hammer.tick() → StringGroup.tick(exc) → · damper_gain → output`
+//! `Hammer.tick() → StrikeComb.tick() → StringGroup.tick(exc) → · damper_gain → output`
 //!
+//! - The strike comb imposes the hammer's strike-position weighting
+//!   (dips on the 7th-partial family) on the excitation before it reaches
+//!   the strings — see [`crate::domain::strike_comb`].
 //! - Number of strings depends on the MIDI note range (see
 //!   [`strings_for_note`]).
 //! - Damper applies to the summed string output, so a release fades the
@@ -17,6 +20,7 @@
 //! because they are perceptually closer to silent.
 
 use crate::domain::hammer::Hammer;
+use crate::domain::strike_comb::StrikeComb;
 use crate::domain::string_group::{strings_for_note, StringGroup};
 
 /// MIDI note → frequency in Hz (A4 = 440 Hz, MIDI 69).
@@ -107,6 +111,7 @@ pub struct Voice {
     sample_rate: f32,
     strings: StringGroup,
     hammer: Hammer,
+    strike_comb: StrikeComb,
     note: u8,
     damper_gain: f32,
     damper_decay: f32,
@@ -128,6 +133,7 @@ impl Voice {
             sample_rate,
             strings: StringGroup::new(sample_rate, max_delay),
             hammer: Hammer::new(sample_rate),
+            strike_comb: StrikeComb::new(max_delay),
             note: 0,
             damper_gain: 0.0,
             // Overwritten on every note_on with a note-dependent value.
@@ -166,7 +172,9 @@ impl Voice {
         let v = (velocity as f32 / 127.0).clamp(0.0, 1.0);
         self.strings.pluck(freq, n_strings);
         self.strings.set_loop_gain(string_loop_gain(note));
-        self.hammer.fire(v);
+        self.hammer.fire(v, freq);
+        self.strike_comb
+            .set_period(self.sample_rate / freq.max(MIN_FREQUENCY_HZ));
         self.damper_decay = damper_decay_per_sample(note, self.sample_rate);
         self.damper_gain = 1.0;
         self.released = false;
@@ -199,7 +207,7 @@ impl Voice {
         if !self.strings.is_active() {
             return 0.0;
         }
-        let exc = self.hammer.tick();
+        let exc = self.strike_comb.tick(self.hammer.tick());
         let s = self.strings.tick(exc);
         let out = s * self.damper_gain;
         if self.released {

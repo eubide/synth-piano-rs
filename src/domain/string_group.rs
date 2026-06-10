@@ -14,6 +14,18 @@
 //! `f+δ` produces an amplitude modulation at rate `δ`. Listeners hear this
 //! as the "body" of the tone and usually attribute it to the soundboard.
 //!
+//! ## Bass: two polarizations instead of two strings
+//! A single wound bass string still beats: it vibrates in two transverse
+//! polarizations (vertical and horizontal) whose effective terminations at
+//! the bridge differ slightly, detuning them by a cent or so (Weinreich
+//! 1977). The partials of the two polarizations drift in and out of phase —
+//! partial `k` beats at `k` times the fundamental detune — producing the
+//! slow shimmer a real bass note has. A lone KS loop decays as a featureless
+//! exponential instead, which reads as "electronic". For single-string notes
+//! we arm a second, quieter loop detuned by ~+1.4 cents to stand in for the
+//! horizontal polarization. It reuses one of the pre-allocated string slots,
+//! so it costs nothing extra at construction time.
+//!
 //! ## What this module does NOT model
 //! Real strings are mechanically coupled through the bridge, which causes
 //! a "two-stage decay": an initial fast decay from the in-phase mode whose
@@ -21,7 +33,8 @@
 //! out-of-phase mode whose net force on the bridge is small (Weinreich
 //! 1977). Implementing that needs a coupled-waveguide network with a
 //! shared termination filter — useful enough to be a candidate for a
-//! Phase 5b refinement, but out of scope here.
+//! Phase 5b refinement, but out of scope here. (The bass polarization pair
+//! above shares one loop gain, so both decay at the same rate.)
 
 use crate::domain::string::KarplusStrong;
 
@@ -40,6 +53,16 @@ const DETUNE_CENTS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
     [-0.7, 0.7, 0.0], // n=2: doubles, symmetric ±0.7 cent
     [-1.0, 0.0, 1.0], // n=3: triples, centre + ±1 cent
 ];
+
+/// Detune (in cents) of the second-polarization loop armed for
+/// single-string bass notes, and its output weight. +1.4 cents puts the
+/// 10th partial of C2 at a ~0.5 Hz beat — slow shimmer, not chorus; the
+/// fundamental itself beats over tens of seconds and stays solid. The
+/// weight keeps the horizontal polarization clearly subordinate (the
+/// hammer strikes vertically; the second polarization is only leaked
+/// into via the bridge).
+const BASS_POLARIZATION_DETUNE_CENTS: f32 = 1.4;
+const BASS_POLARIZATION_WEIGHT: f32 = 0.35;
 
 /// `1/√N` normalisation factors, indexed by `active_count`. Pre-computed
 /// to keep the audio path free of square roots.
@@ -66,9 +89,12 @@ pub fn strings_for_note(note: u8) -> usize {
 #[derive(Debug)]
 pub struct StringGroup {
     strings: [KarplusStrong; MAX_STRINGS_PER_NOTE],
-    /// How many of the strings are currently driven by the loop. The
+    /// How many *physical* strings are currently driven by the loop. The
     /// remaining slots stay inactive — `tick(_)` returns 0 for them.
     active_count: usize,
+    /// Single-string bass note: slot 1 holds the second-polarization loop
+    /// (see module docs), mixed in at [`BASS_POLARIZATION_WEIGHT`].
+    bass_polarization: bool,
 }
 
 impl StringGroup {
@@ -76,6 +102,7 @@ impl StringGroup {
         Self {
             strings: std::array::from_fn(|_| KarplusStrong::new(sample_rate, max_delay)),
             active_count: 0,
+            bass_polarization: false,
         }
     }
 
@@ -119,6 +146,13 @@ impl StringGroup {
         for i in n..MAX_STRINGS_PER_NOTE {
             self.strings[i].deactivate();
         }
+        // Single wound bass string: arm a second loop in the spare slot as
+        // its horizontal polarization (see module docs).
+        self.bass_polarization = n == 1;
+        if self.bass_polarization {
+            let f = center_hz * 2.0f32.powf(BASS_POLARIZATION_DETUNE_CENTS / 1200.0);
+            self.strings[1].pluck(f);
+        }
     }
 
     /// Excite each active string with the same input, return the
@@ -139,7 +173,14 @@ impl StringGroup {
         // (bass) at one string and triples (treble) at three sum to
         // comparable subjective levels, instead of triples being −10 dB
         // quieter than singles.
-        sum * STRING_NORM_FACTOR[self.active_count]
+        let mut out = sum * STRING_NORM_FACTOR[self.active_count];
+        // The bass polarization pair is a perturbation on top of the single
+        // string, not a second unison string — mixed at its fixed weight,
+        // outside the √N normalisation (the energy it adds is ~6 %).
+        if self.bass_polarization {
+            out += self.strings[1].tick(excitation) * BASS_POLARIZATION_WEIGHT;
+        }
+        out
     }
 }
 
@@ -195,6 +236,22 @@ mod tests {
             }
         }
         assert!(any_nonzero);
+    }
+
+    #[test]
+    fn single_string_bass_arms_second_polarization() {
+        // A single-string note must still report one *physical* string but
+        // keep a second (detuned, quieter) loop ringing as its horizontal
+        // polarization — the source of the slow bass shimmer.
+        let mut g = StringGroup::new(48_000.0, 4096);
+        g.pluck(65.4, 1);
+        assert_eq!(g.active_count(), 1);
+        assert!(g.bass_polarization);
+        assert!(g.strings[1].is_active(), "polarization loop should ring");
+        // Multi-string notes must NOT arm it — their unison detune already
+        // provides the beating.
+        g.pluck(440.0, 3);
+        assert!(!g.bass_polarization);
     }
 
     #[test]
