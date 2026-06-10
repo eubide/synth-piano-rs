@@ -3,19 +3,28 @@
 //! ## Algorithm (Extended Karplus-Strong, Jaffe & Smith 1983 + dispersion)
 //!
 //! On every audio sample:
-//!   `read    = delay.read_frac(N_int, frac)`
-//!   `lpf_out = lpf.tick(read)`
+//!   `read    = delay.read_int(N_int)`
+//!   `tuned   = tuning.tick(read)`        ← lossless fractional delay
+//!   `lpf_out = lpf.tick(tuned)`
 //!   `disp    = dispersion.tick(lpf_out)`
 //!   `y       = disp + excitation`        ← hammer enters here, undispersed
 //!   `delay.write(y)`
 //!   `output  = y`
 //!
+//! ## Why an allpass tuner, not linear interpolation
+//! Linear interpolation of the fractional delay is a 2-tap FIR whose loss
+//! peaks at `frac = 0.5` — harmless for a single traversal, but inside a
+//! resonant loop it compounds `f₀` times per second. At C7 it alone kills
+//! the fundamental in ≈ 0.35 s, faster than the loop filter. A first-order
+//! allpass has unity magnitude at every frequency, so tuning costs no
+//! decay time anywhere on the keyboard (Jaffe & Smith 1983, §"Tuning").
+//!
 //! ## Tuning compensation
 //! The loop has three delay-affecting components: the integer + fractional
-//! delay line, the two-tap LPF (constant ½-sample phase delay), and the
-//! dispersion cascade (group delay varies with frequency). To make the
-//! fundamental land on the requested `f₀`, we set:
-//!   `D + 0.5 + N·τ_g(ω₀) = Fs / f₀`
+//! delay line, the two-tap LPF (phase delay = its smoothing weight `s`),
+//! and the dispersion cascade (group delay varies with frequency). To make
+//! the fundamental land on the requested `f₀`, we set:
+//!   `D + s + N·τ_g(ω₀) = Fs / f₀`
 //! and recover `D` from there. The cascade group delay is computed
 //! analytically at `ω₀` (not at DC) — important for high notes where the
 //! difference matters.
@@ -30,16 +39,48 @@ use std::f32::consts::TAU;
 
 use crate::domain::delay_line::DelayLine;
 use crate::domain::dispersion::DispersionCascade;
-use crate::domain::filter::TwoTapLowpass;
+use crate::domain::filter::{AllpassFirstOrder, TwoTapLowpass};
+
+/// Floor on the loop filter's own T60 at the fundamental, in seconds.
+///
+/// The loop filter's job is *spectral* shaping (high partials die first);
+/// the overall envelope is owned by the per-note loop gain the voice
+/// installs. But at the classic `s = 0.5` the filter alone kills a C7
+/// fundamental in ≈ 0.35 s — far shorter than any plausible treble
+/// envelope, leaving the top octaves attack-only. (This went unnoticed for
+/// a while because the unipolar hammer pulse parked a DC pedestal in the
+/// loop, which the filter passes losslessly; once the strike comb removed
+/// the DC, the real decay surfaced.) Above ≈ G5 we shrink the smoothing so
+/// the filter's own fundamental T60 never drops below this floor. Per-pass
+/// loss at the fundamental is ≈ `s(1−s)(1−cos ω₀)` nepers, hence
+/// `T60 = ln(10³) / (f₀ · s(1−s) · (1−cos ω₀))`.
+///
+/// 4 s (down from an initial 6 s) keeps the top octaves ringing audibly
+/// while letting their upper partials die noticeably faster — at 6 s the
+/// sustained inharmonic highs read as "metallic" / bell-like.
+const LOOP_FILTER_T60_FLOOR_SECS: f32 = 4.0;
+
+/// Smoothing weight for a note at `freq`: the largest `s ≤ 0.5` whose
+/// fundamental T60 stays at or above [`LOOP_FILTER_T60_FLOOR_SECS`].
+/// Saturates at 0.5 (no change) below ≈ 800 Hz.
+fn loop_filter_smoothing(freq: f32, sample_rate: f32) -> f32 {
+    let omega_0 = TAU * freq / sample_rate;
+    // p = s(1−s), capped at its s = 0.5 maximum of 0.25. The division is
+    // safe: callers pluck at freq > 0, and a vanishing (1−cos ω₀) just
+    // sends the budget to +inf, where `min` saturates.
+    let p = (6.907_755_3 / (LOOP_FILTER_T60_FLOOR_SECS * freq * (1.0 - omega_0.cos()))).min(0.25);
+    0.5 - (0.25 - p).sqrt()
+}
 
 #[derive(Debug)]
 pub struct KarplusStrong {
     sample_rate: f32,
     delay: DelayLine,
+    /// Lossless fractional-delay tuner (see module docs).
+    tuning: AllpassFirstOrder,
     lpf: TwoTapLowpass,
     dispersion: DispersionCascade,
     delay_int: usize,
-    delay_frac: f32,
     active: bool,
     /// Multiplicative loss applied to the loop output before it is written
     /// back into the delay line. `1.0` = no extra loss (the LPF still
@@ -54,10 +95,10 @@ impl KarplusStrong {
         Self {
             sample_rate,
             delay: DelayLine::new(max_delay),
+            tuning: AllpassFirstOrder::new(),
             lpf: TwoTapLowpass::new(),
             dispersion: DispersionCascade::new(),
             delay_int: 1,
-            delay_frac: 0.0,
             active: false,
             loop_gain: 1.0,
         }
@@ -88,15 +129,17 @@ impl KarplusStrong {
     /// coefficient, and tunes the delay length so `f₀` still lands on
     /// target despite the cascade's contribution.
     pub fn pluck(&mut self, freq: f32) {
-        // 1. Pick dispersion strength for this note.
+        // 1. Pick dispersion strength and loop-filter smoothing for this note.
         self.dispersion.fit_to_frequency(freq, self.sample_rate);
+        let s = loop_filter_smoothing(freq, self.sample_rate);
+        self.lpf.set_smoothing(s);
 
-        // 2. Tune the delay line. Subtract LPF phase delay (½) and the
+        // 2. Tune the delay line. Subtract the LPF phase delay (= s) and the
         //    cascade's group delay *at the fundamental*. Using ω₀ rather
         //    than DC keeps high notes in tune.
         let omega_0 = TAU * freq / self.sample_rate;
         let cascade_delay = self.dispersion.group_delay_at(omega_0);
-        let total = self.sample_rate / freq - 0.5 - cascade_delay;
+        let total = self.sample_rate / freq - s - cascade_delay;
 
         // 3. Clamp to the buffer-imposed window. Notes that need more than
         //    the buffer holds get clipped at the bottom; notes whose total
@@ -104,11 +147,20 @@ impl KarplusStrong {
         //    top — pitch will be slightly off but the loop stays stable.
         let max_total = (self.delay.capacity() - 2) as f32;
         let total = total.clamp(2.0, max_total);
-        self.delay_int = total.floor() as usize;
-        self.delay_frac = total - self.delay_int as f32;
 
-        // 4. Wipe state. Energy enters only via tick()'s `excitation`.
+        // 4. Split into integer delay + tuning allpass. Keeping the
+        //    fractional part in [0.3, 1.3) keeps the allpass coefficient
+        //    well inside the unit circle (a ∈ (−0.13, 0.54]). The DC
+        //    phase-delay formula `a = (1−frac)/(1+frac)` is exact in the
+        //    low-frequency limit; the treble-end error is under a cent.
+        let d_int = (total - 0.3).floor().max(1.0);
+        let frac = total - d_int;
+        self.delay_int = d_int as usize;
+        self.tuning.set_coefficient((1.0 - frac) / (1.0 + frac));
+
+        // 5. Wipe state. Energy enters only via tick()'s `excitation`.
         self.delay.clear();
+        self.tuning.reset();
         self.lpf.reset();
         self.dispersion.reset();
         self.active = true;
@@ -119,8 +171,9 @@ impl KarplusStrong {
         if !self.active {
             return 0.0;
         }
-        let read = self.delay.read_frac(self.delay_int, self.delay_frac);
-        let lpf_out = self.lpf.tick(read);
+        let read = self.delay.read_int(self.delay_int);
+        let tuned = self.tuning.tick(read);
+        let lpf_out = self.lpf.tick(tuned);
         let disp = self.dispersion.tick(lpf_out);
         let y = disp + excitation;
         // Apply loop loss to the *recirculated* portion only. The voice

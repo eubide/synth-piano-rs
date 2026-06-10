@@ -1,16 +1,17 @@
 //! Filter primitives used inside the Karplus-Strong loop and elsewhere.
 //!
 //! ## TwoTapLowpass
-//! `y[n] = ½·(x[n] + x[n-1])`. Frequency response
-//! `H(ω) = cos(ω/2)·exp(-jω/2)`. Two important properties for piano synth:
-//! 1. **Constant phase delay of exactly ½ sample**, independent of frequency.
-//!    Lets us compensate the loop length precisely so the perceived pitch
-//!    matches `Fs/N` without fancy allpass tuning (Smith, "Physical Audio
-//!    Signal Processing", §6.10).
-//! 2. **Magnitude rolls off as `cos(ω/2)`**, zero at Nyquist. High partials
-//!    lose energy each loop pass → natural string-like decay, with HF dying
-//!    faster than LF. This is exactly the behaviour Karplus & Strong (1983)
-//!    chose for their original "plucked string" algorithm.
+//! `y[n] = (1−s)·x[n] + s·x[n−1]` with smoothing weight `s ∈ [0, 0.5]`.
+//! At `s = 0.5` this is the classic Karplus & Strong (1983) average:
+//! `H(ω) = cos(ω/2)·exp(−jω/2)`, magnitude zero at Nyquist, so high partials
+//! lose energy each loop pass → natural string-like decay with HF dying
+//! faster than LF. Smaller `s` reduces the per-pass loss smoothly toward a
+//! pure pass-through (`s = 0`) — the Jaffe & Smith "stretching" weight, used
+//! to keep short treble loops from over-damping their own fundamental.
+//!
+//! Phase delay is `s` samples in the low-frequency limit (exactly ½ at
+//! `s = 0.5` for all frequencies). The loop tuner subtracts `s`; the
+//! treble-end approximation error is well under a cent.
 
 /// Tunable one-pole lowpass: `y[n] = (1−α)·x[n] + α·y[n−1]`.
 /// Pole at `z = α`; DC gain = 1; rolls off at `−6 dB/octave` past cutoff.
@@ -27,10 +28,7 @@ pub struct OnePoleLowpass {
 
 impl OnePoleLowpass {
     pub fn new() -> Self {
-        Self {
-            a: 0.0,
-            state: 0.0,
-        }
+        Self { a: 0.0, state: 0.0 }
     }
 
     pub fn set_cutoff(&mut self, cutoff_hz: f32, sample_rate: f32) {
@@ -130,14 +128,26 @@ impl Default for AllpassFirstOrder {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct TwoTapLowpass {
+    s: f32,
     prev: f32,
 }
 
 impl TwoTapLowpass {
     pub fn new() -> Self {
-        Self::default()
+        Self { s: 0.5, prev: 0.0 }
+    }
+
+    /// Set the smoothing weight `s ∈ [0, 0.5]`. `0.5` = classic KS average
+    /// (maximum HF loss); smaller values shrink the per-pass loss — see the
+    /// module docs.
+    pub fn set_smoothing(&mut self, s: f32) {
+        self.s = s.clamp(0.0, 0.5);
+    }
+
+    pub fn smoothing(&self) -> f32 {
+        self.s
     }
 
     pub fn reset(&mut self) {
@@ -146,9 +156,15 @@ impl TwoTapLowpass {
 
     #[inline]
     pub fn tick(&mut self, x: f32) -> f32 {
-        let y = 0.5 * (x + self.prev);
+        let y = (1.0 - self.s) * x + self.s * self.prev;
         self.prev = x;
         y
+    }
+}
+
+impl Default for TwoTapLowpass {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -284,7 +300,10 @@ mod tests {
             }
         }
         let gain = (y_sq / x_sq).sqrt();
-        assert!((gain - 1.0).abs() < 1e-3, "expected unity magnitude, got {gain}");
+        assert!(
+            (gain - 1.0).abs() < 1e-3,
+            "expected unity magnitude, got {gain}"
+        );
     }
 
     #[test]
@@ -302,10 +321,7 @@ mod tests {
         let mut ap = AllpassFirstOrder::new();
         ap.set_coefficient(-0.5);
         let td = ap.group_delay_at(std::f32::consts::PI);
-        assert!(
-            (td - 1.0 / 3.0).abs() < 1e-5,
-            "got {td}, expected 1/3"
-        );
+        assert!((td - 1.0 / 3.0).abs() < 1e-5, "got {td}, expected 1/3");
     }
 
     #[test]
