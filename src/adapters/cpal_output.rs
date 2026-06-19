@@ -120,7 +120,8 @@ fn pick_config(device: &cpal::Device) -> Result<(cpal::StreamConfig, cpal::Sampl
     // Prefer a config that includes 48 kHz with f32 samples.
     let mut chosen = None;
     for cfg in supported_iter {
-        let includes_target = cfg.min_sample_rate() <= target_sr && cfg.max_sample_rate() >= target_sr;
+        let includes_target =
+            cfg.min_sample_rate() <= target_sr && cfg.max_sample_rate() >= target_sr;
         if includes_target {
             chosen = Some(cfg.with_sample_rate(target_sr));
             if chosen.as_ref().unwrap().sample_format() == cpal::SampleFormat::F32 {

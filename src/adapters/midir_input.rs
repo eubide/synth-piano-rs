@@ -4,8 +4,8 @@
 //! engine's [`MidiEvent`](crate::domain::MidiEvent) vocabulary, and pushes
 //! them through the SPSC ring buffer that the audio thread drains.
 //!
-//! Phase 1 understands Note On, Note Off and `All Notes Off` (CC 123).
-//! Sustain pedal and other CCs land in later phases.
+//! Understands Note On, Note Off, sustain pedal (CC 64) and `All Notes
+//! Off` (CC 123). Other CCs, SysEx and pitch bend are dropped silently.
 
 use anyhow::{anyhow, Context, Result};
 use midir::{MidiInput as MidirMidiInput, MidiInputConnection};
@@ -100,7 +100,10 @@ mod tests {
     fn note_on_with_velocity_parses() {
         assert_eq!(
             parse_message(&[0x90, 60, 100]),
-            Some(MidiEvent::NoteOn { note: 60, velocity: 100 })
+            Some(MidiEvent::NoteOn {
+                note: 60,
+                velocity: 100
+            })
         );
     }
 
@@ -122,10 +125,7 @@ mod tests {
 
     #[test]
     fn all_notes_off_parses() {
-        assert_eq!(
-            parse_message(&[0xB0, 123, 0]),
-            Some(MidiEvent::AllNotesOff)
-        );
+        assert_eq!(parse_message(&[0xB0, 123, 0]), Some(MidiEvent::AllNotesOff));
     }
 
     #[test]
@@ -162,7 +162,10 @@ mod tests {
         // Note On on channel 5 (status 0x94).
         assert_eq!(
             parse_message(&[0x94, 60, 100]),
-            Some(MidiEvent::NoteOn { note: 60, velocity: 100 })
+            Some(MidiEvent::NoteOn {
+                note: 60,
+                velocity: 100
+            })
         );
     }
 

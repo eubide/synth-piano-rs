@@ -34,7 +34,10 @@ mod tests {
     fn equality_holds_for_same_payload() {
         assert_eq!(
             MidiEvent::note_on(60, 100),
-            MidiEvent::NoteOn { note: 60, velocity: 100 }
+            MidiEvent::NoteOn {
+                note: 60,
+                velocity: 100
+            }
         );
         assert_eq!(MidiEvent::note_off(60), MidiEvent::NoteOff { note: 60 });
     }

@@ -112,10 +112,6 @@ impl KarplusStrong {
         self.loop_gain = gain.clamp(0.0, 1.0);
     }
 
-    pub fn loop_gain(&self) -> f32 {
-        self.loop_gain
-    }
-
     pub fn is_active(&self) -> bool {
         self.active
     }

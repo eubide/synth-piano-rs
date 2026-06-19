@@ -218,7 +218,7 @@ mod tests {
             (sq / (n - 1_000) as f32).sqrt()
         }
         let mut sb_at_mode = Soundboard::new(48_000.0);
-        let on_mode = steady_rms(&mut sb_at_mode, 270.0); // matches MODES[3]
+        let on_mode = steady_rms(&mut sb_at_mode, 270.0); // matches MODES[5]
         let mut sb_off_mode = Soundboard::new(48_000.0);
         // 7_000 Hz is well above every mode centre.
         let off_mode = steady_rms(&mut sb_off_mode, 7_000.0);

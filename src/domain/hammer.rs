@@ -14,15 +14,17 @@
 //!   is "rounder", spectrum is biased to low frequencies → dull tone.
 //! - Hard strike: felt compresses, contact is brief and sharp, force pulse
 //!   contains higher frequencies → bright tone.
+//!
 //! Mapping that to a single first-order LPF cutoff `f_c(v)` is a deliberate
 //! simplification (Bank & Sujbert 2003 use a full non-linear contact model)
 //! but it captures the perceptual dimension we care about with very little
 //! state.
 //!
 //! ## Mapping
-//! `f_c(v) = lerp(800 Hz, 6000 Hz, v^0.7)` for `v ∈ [0, 1]`.
-//! `^0.7` flattens the curve at high velocity, mirroring real felt that
-//! "saturates" once heavily compressed.
+//! `f_c(v) = lerp(300 Hz, 7000 Hz, v^1.5)` for `v ∈ [0, 1]`.
+//! The `^1.5` warp clusters the cutoff toward 300 Hz at low velocity,
+//! mirroring real felt that stays soft and damps high frequencies for `pp`
+//! strikes.
 
 use std::f32::consts::TAU;
 

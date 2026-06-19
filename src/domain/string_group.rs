@@ -70,7 +70,7 @@ const STRING_NORM_FACTOR: [f32; MAX_STRINGS_PER_NOTE + 1] = [
     0.0,          // n=0 (silent)
     1.0,          // 1/√1
     0.707_106_77, // 1/√2
-    0.577_350_30, // 1/√3
+    0.577_350_3,  // 1/√3
 ];
 
 /// Map a MIDI note to its string count. Crossovers chosen to match the
@@ -139,8 +139,8 @@ impl StringGroup {
         let n = n_strings.clamp(1, MAX_STRINGS_PER_NOTE);
         self.active_count = n;
         let detunes = DETUNE_CENTS[n];
-        for i in 0..n {
-            let f = center_hz * 2.0f32.powf(detunes[i] / 1200.0);
+        for (i, &cents) in detunes.iter().enumerate().take(n) {
+            let f = center_hz * 2.0f32.powf(cents / 1200.0);
             self.strings[i].pluck(f);
         }
         for i in n..MAX_STRINGS_PER_NOTE {

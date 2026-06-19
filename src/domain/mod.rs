@@ -8,7 +8,6 @@ pub mod engine;
 pub mod filter;
 pub mod hammer;
 pub mod midi_event;
-pub mod rng;
 pub mod soundboard;
 pub mod strike_comb;
 pub mod string;

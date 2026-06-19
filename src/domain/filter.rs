@@ -146,10 +146,6 @@ impl TwoTapLowpass {
         self.s = s.clamp(0.0, 0.5);
     }
 
-    pub fn smoothing(&self) -> f32 {
-        self.s
-    }
-
     pub fn reset(&mut self) {
         self.prev = 0.0;
     }
@@ -382,7 +378,6 @@ mod tests {
         }
         let gain = (y_sq_sum / x_sq_sum).sqrt();
         let expected = (omega / 2.0).cos();
-        let _ = TAU; // silence unused-import warning
         assert!(
             (gain - expected).abs() < 0.01,
             "gain {gain} expected ~{expected}"
