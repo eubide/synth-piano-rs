@@ -258,7 +258,7 @@ impl Engine {
 }
 
 /// Amplitude below which the output bus is passed through untouched. With
-/// `master_gain = 0.34` a single fortissimo note peaks ≈ 0.5 and even an
+/// `master_gain = 0.38` a single fortissimo note peaks ≈ 0.5 and even an
 /// ordinary mezzo-forte 3-note chord stays below this knee, so normal
 /// playing is perfectly linear; the saturator only engages on genuinely
 /// dense fortissimo clusters. 0.88 leaves 0.12 of range for the soft knee

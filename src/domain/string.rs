@@ -153,7 +153,9 @@ impl KarplusStrong {
         //    well inside the unit circle (a ∈ (−0.13, 0.54]). The DC
         //    phase-delay formula `a = (1−frac)/(1+frac)` is exact in the
         //    low-frequency limit; the treble-end error is under a cent.
-        let d_int = (total - 0.3).floor().max(1.0);
+        // `total` is clamped to ≥ 2.0 above, so `total − 0.3 ≥ 1.7` and the
+        // floor is always ≥ 1 — no separate lower guard on `d_int` is needed.
+        let d_int = (total - 0.3).floor();
         let frac = total - d_int;
         self.delay_int = d_int as usize;
         self.tuning.set_coefficient((1.0 - frac) / (1.0 + frac));
