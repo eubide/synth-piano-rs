@@ -12,7 +12,7 @@
 //! We approximate the plate with **18 bandpass biquads in parallel**,
 //! covering 50 Hz – 5.5 kHz with logarithmic-ish spacing. Each biquad is
 //! a second-order resonator — exactly the DSP equivalent of a mechanical
-//! mass-spring-damper. The 16 modes are not real measurements; they're a
+//! mass-spring-damper. The 18 modes are not real measurements; they're a
 //! plausible distribution that produces audibly "wooden" coloration.
 //!
 //! ## Wet / dry mix
