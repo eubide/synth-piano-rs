@@ -65,15 +65,6 @@ impl DelayLine {
         let s1 = self.read_int(d_int + 1);
         s0 * (1.0 - frac) + s1 * frac
     }
-
-    /// Place `x` at position `offset` samples behind the write head, without
-    /// moving the head. Used to splat an entire excitation burst into the
-    /// recently-written portion of the line at note-on time.
-    #[inline]
-    pub fn poke(&mut self, offset: usize, x: f32) {
-        let idx = self.write_pos.wrapping_sub(offset) & self.mask;
-        self.buffer[idx] = x;
-    }
 }
 
 #[cfg(test)]
@@ -115,16 +106,6 @@ mod tests {
         }
         // read_int(1)=40, read_int(2)=30 → frac 0.25 → 0.75*40 + 0.25*30 = 37.5
         assert!((d.read_frac(1, 0.25) - 37.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn poke_writes_at_offset_without_advancing() {
-        let mut d = DelayLine::new(16);
-        d.poke(1, 9.0);
-        assert_eq!(d.read_int(1), 9.0);
-        // write head untouched: the next write should land at index 0
-        d.write(1.0);
-        assert_eq!(d.read_int(1), 1.0);
     }
 
     #[test]

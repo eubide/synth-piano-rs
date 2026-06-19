@@ -242,10 +242,6 @@ impl Voice {
         }
         out
     }
-
-    pub fn sample_rate(&self) -> f32 {
-        self.sample_rate
-    }
 }
 
 #[cfg(test)]
