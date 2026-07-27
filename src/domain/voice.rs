@@ -69,10 +69,15 @@ const ENV_RELEASE_SECS: f32 = 0.02;
 /// between these so each register decays at a physically plausible rate.
 ///
 /// Without this the strings run at `loop_gain = 1.0` and the only loss is
-/// the loop LPF, which removes HF but barely touches a low fundamental — so
+/// the loop LPF, which barely touches a low fundamental — so
 /// a held bass/mid note would ring almost forever (organ-like), the single
 /// biggest realism defect. The LPF still shapes the *spectral* decay (highs
 /// die first); this just sets the overall envelope length per pitch.
+///
+/// These targets are *nominal*: [`StringGroup::set_loop_gain`] spreads each
+/// unison string's T60 around them (and gives the bass polarization a much
+/// longer one) to produce the two-stage decay, so the audible tail of a
+/// note outlives the nominal figure by design.
 const STRING_T60_BASS_SECS: f32 = 20.0;
 const STRING_T60_TREBLE_SECS: f32 = 4.0;
 
@@ -314,7 +319,12 @@ mod tests {
         // physically plausible time (seconds — not forever, not instantly),
         // and the bass must sustain audibly longer than the treble. Before
         // the per-note loop gain the fundamental never decayed (organ-like).
-        let bass = held_note_t60_secs(36, 16.0); // C2
+        // The bass tail is carried by the slow polarization loop (T60 factor
+        // 1.9 at −9 dB weight), so the audible T60 lands well past the
+        // nominal 15 s target — that aftersound is the two-stage decay
+        // working as intended, matching the tens of seconds a real grand's
+        // bass quietly rings.
+        let bass = held_note_t60_secs(36, 28.0); // C2
         let treble = held_note_t60_secs(96, 10.0); // C7
         assert!(
             bass > treble + 1.0,
@@ -322,7 +332,7 @@ mod tests {
         );
         // Finite decay — would equal the cap if it rang forever.
         assert!(
-            bass < 15.5,
+            bass < 27.0,
             "bass should still decay (not ring forever): {bass}"
         );
         assert!(
@@ -330,7 +340,7 @@ mod tests {
             "treble T60 out of plausible range: {treble}"
         );
         assert!(
-            (6.0..15.5).contains(&bass),
+            (10.0..27.0).contains(&bass),
             "bass T60 out of plausible range: {bass}"
         );
     }

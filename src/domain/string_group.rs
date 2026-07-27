@@ -26,15 +26,22 @@
 //! horizontal polarization. It reuses one of the pre-allocated string slots,
 //! so it costs nothing extra at construction time.
 //!
-//! ## What this module does NOT model
+//! ## Two-stage decay (approximated)
 //! Real strings are mechanically coupled through the bridge, which causes
 //! a "two-stage decay": an initial fast decay from the in-phase mode whose
-//! energy leaves through the bridge, then a long slow tail from the
-//! out-of-phase mode whose net force on the bridge is small (Weinreich
-//! 1977). Implementing that needs a coupled-waveguide network with a
-//! shared termination filter — useful enough to be a candidate for a
-//! Phase 5b refinement, but out of scope here. (The bass polarization pair
-//! above shares one loop gain, so both decay at the same rate.)
+//! energy leaves through the bridge, then a long slow tail ("aftersound")
+//! from the out-of-phase mode whose net force on the bridge is small
+//! (Weinreich 1977). The full model needs a coupled-waveguide network with
+//! a shared termination filter; we approximate its *audible signature*
+//! instead: each unison string gets a different T60 (see
+//! [`DECAY_T60_FACTORS`]), so the summed envelope starts at the average
+//! decay rate and flattens as the slowest string takes over — a convex
+//! dB-envelope with a distinct knee, where a single loop gain gives the
+//! straight-line exponential that reads as "electronic". Single-string
+//! bass notes get the same treatment through their polarization pair: the
+//! horizontal polarization decays much more slowly
+//! ([`BASS_POLARIZATION_T60_FACTOR`]), which is precisely Weinreich's
+//! vertical→horizontal aftersound.
 
 use crate::domain::string::KarplusStrong;
 
@@ -63,6 +70,26 @@ const DETUNE_CENTS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
 /// into via the bridge).
 const BASS_POLARIZATION_DETUNE_CENTS: f32 = 1.4;
 const BASS_POLARIZATION_WEIGHT: f32 = 0.35;
+
+/// Per-string T60 multipliers, indexed by `[active_count][string_index]`.
+/// The spread around the nominal per-note T60 is what produces the
+/// two-stage decay (see module docs): the fastest string dominates the
+/// early slope, the slowest owns the tail. Values keep the *geometric
+/// mean* close to 1 so the overall note length stays near the nominal
+/// target the voice installs.
+const DECAY_T60_FACTORS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
+    [1.0, 1.0, 1.0],  // n=0 (unused)
+    [1.0, 1.0, 1.0],  // n=1: single string (polarization handled below)
+    [0.75, 1.3, 1.0], // n=2
+    [0.7, 1.0, 1.35], // n=3
+];
+
+/// T60 multiplier for the bass polarization loop. The horizontal
+/// polarization couples weakly to the bridge, so it outlives the struck
+/// vertical polarization by a wide margin — Weinreich's "aftersound". At
+/// its 0.35 output weight the tail sits ≈ 9 dB below the note's body and
+/// emerges as the main string fades.
+const BASS_POLARIZATION_T60_FACTOR: f32 = 1.9;
 
 /// `1/√N` normalisation factors, indexed by `active_count`. Pre-computed
 /// to keep the audio path free of square roots.
@@ -110,14 +137,20 @@ impl StringGroup {
         self.active_count
     }
 
-    /// Set the per-cycle loop loss on every string in the group. The voice
-    /// uses this to give each note a pitch-dependent decay rate: without it
-    /// the only loss is the loop LPF, which barely touches the fundamental
-    /// of bass/mid notes (they would ring almost forever). See
-    /// [`crate::domain::voice`] for the T60 → loop-gain mapping.
+    /// Set the per-cycle loop loss for the group from the note's *nominal*
+    /// loop gain (see [`crate::domain::voice`] for the T60 → gain mapping).
+    /// Each string receives `gain^(1/factor)` — a per-cycle gain whose T60
+    /// is the nominal times its [`DECAY_T60_FACTORS`] entry — so the unison
+    /// decays at spread rates and the summed envelope shows the two-stage
+    /// knee (module docs). Call after [`StringGroup::pluck`], which sets
+    /// the string count the factor lookup depends on.
     pub fn set_loop_gain(&mut self, gain: f32) {
-        for s in &mut self.strings {
-            s.set_loop_gain(gain);
+        let factors = &DECAY_T60_FACTORS[self.active_count];
+        for (s, &factor) in self.strings.iter_mut().zip(factors).take(self.active_count) {
+            s.set_loop_gain(gain.powf(1.0 / factor));
+        }
+        if self.bass_polarization {
+            self.strings[1].set_loop_gain(gain.powf(1.0 / BASS_POLARIZATION_T60_FACTOR));
         }
     }
 
@@ -262,6 +295,59 @@ mod tests {
         for _ in 0..512 {
             assert_eq!(g.tick(0.0), 0.0);
         }
+    }
+
+    /// Two-stage decay: the tail of a group whose unison T60s are spread
+    /// must far outlive the tail of the same group forced to a uniform
+    /// nominal gain (the pre-spread behaviour). Comparing against the
+    /// uniform twin isolates the spread's contribution — the loop LPF's
+    /// spectral decay affects both renders identically.
+    fn late_tail_rms(n_strings: usize, freq: f32, t60: f32, uniform: bool) -> f32 {
+        const SR: f32 = 48_000.0;
+        let mut g = StringGroup::new(SR, 4096);
+        g.pluck(freq, n_strings);
+        // Nominal per-cycle gain for the requested T60 (same formula the
+        // voice uses): gain = exp(ln(10⁻³) / (f₀·T60)).
+        let gain = (-6.907_755_3 / (freq * t60)).exp();
+        if uniform {
+            // Bypass the group's factor table: every loop (including the
+            // bass polarization slot) decays at the nominal rate.
+            for s in &mut g.strings {
+                s.set_loop_gain(gain);
+            }
+        } else {
+            g.set_loop_gain(gain);
+        }
+        let n = (4.0 * SR) as usize;
+        let mut buf = vec![0.0f32; n];
+        buf[0] = g.tick(1.0);
+        for v in buf.iter_mut().skip(1) {
+            *v = g.tick(0.0);
+        }
+        let tail = &buf[(3.5 * SR) as usize..];
+        (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn unison_spread_produces_two_stage_decay() {
+        let spread = late_tail_rms(3, 440.0, 1.5, false);
+        let uniform = late_tail_rms(3, 440.0, 1.5, true);
+        assert!(
+            spread > uniform * 4.0,
+            "spread T60s should leave a much longer tail: spread={spread} uniform={uniform}"
+        );
+    }
+
+    #[test]
+    fn bass_polarization_produces_aftersound() {
+        // Single wound string: the long-lived horizontal polarization must
+        // carry the tail once the struck vertical polarization has faded.
+        let spread = late_tail_rms(1, 65.4, 2.0, false);
+        let uniform = late_tail_rms(1, 65.4, 2.0, true);
+        assert!(
+            spread > uniform * 4.0,
+            "polarization aftersound missing: spread={spread} uniform={uniform}"
+        );
     }
 
     /// Detune breaks perfect periodicity. With 3 strings tuned slightly
