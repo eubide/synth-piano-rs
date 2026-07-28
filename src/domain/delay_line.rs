@@ -35,6 +35,16 @@ impl DelayLine {
         self.buffer.len()
     }
 
+    /// Multiply every stored sample by `g`, leaving the write head where it
+    /// is. The delay line is linear, so this scales the whole future
+    /// zero-input response by `g` without introducing a discontinuity —
+    /// used to fold an output-side gain back into the loop state.
+    pub fn scale(&mut self, g: f32) {
+        for s in self.buffer.iter_mut() {
+            *s *= g;
+        }
+    }
+
     /// Zero the buffer and rewind the write head.
     pub fn clear(&mut self) {
         for s in self.buffer.iter_mut() {

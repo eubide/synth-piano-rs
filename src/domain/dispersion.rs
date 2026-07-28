@@ -100,6 +100,14 @@ impl DispersionCascade {
         }
     }
 
+    /// Multiply every stage's state by `g` (see
+    /// [`AllpassFirstOrder::scale_state`]).
+    pub fn scale_state(&mut self, g: f32) {
+        for s in &mut self.stages {
+            s.scale_state(g);
+        }
+    }
+
     #[inline]
     pub fn tick(&mut self, x: f32) -> f32 {
         // Allpasses cascade by sequential application; their phase

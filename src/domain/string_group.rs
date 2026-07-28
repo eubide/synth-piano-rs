@@ -165,6 +165,16 @@ impl StringGroup {
         }
     }
 
+    /// Scale every string's loop state by `g` — see
+    /// [`KarplusStrong::scale_state`]. The group's output drops to `g` times
+    /// what it was, continuously, while any excitation fed in afterwards
+    /// still passes at full level.
+    pub fn scale_state(&mut self, g: f32) {
+        for s in &mut self.strings {
+            s.scale_state(g);
+        }
+    }
+
     /// Pluck `n_strings` (clamped to [1, MAX]) tuned around `center_hz`
     /// with the per-count detune profile. Strings beyond `n_strings`
     /// are deactivated.
