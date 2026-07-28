@@ -27,7 +27,10 @@
 //!   through the bridge and the radiation impedance.
 //! - Q is frequency-independent within each mode — a real plate has
 //!   slightly varying loss factors.
-//! - No directional radiation. Output is monaural.
+//! - No directional radiation from a single plate: each instance is
+//!   monaural. The engine approximates directionality by running a pair of
+//!   plates with oppositely skewed mode sets (see [`Soundboard::new_skewed`])
+//!   rather than by modelling radiation angles.
 
 use crate::domain::biquad::Biquad;
 
@@ -82,11 +85,22 @@ pub struct Soundboard {
 
 impl Soundboard {
     pub fn new(sample_rate: f32) -> Self {
+        Self::new_skewed(sample_rate, 0.0)
+    }
+
+    /// Build a plate whose mode centres are shifted by ±`skew` (alternating
+    /// sign per mode). Two instances with opposite skew make a decorrelated
+    /// stereo pair: interchannel decorrelation is what the ear reads as
+    /// source *width*, while the alternation keeps each channel's average
+    /// coloration on the shared modal skeleton. `skew = 0` reproduces the
+    /// nominal mono plate.
+    pub fn new_skewed(sample_rate: f32, skew: f32) -> Self {
         let mut modes: [Biquad; N_MODES] = [Biquad::new(); N_MODES];
         let mut mode_gains = [0.0f32; N_MODES];
         for i in 0..N_MODES {
             let (freq, q, gain) = MODES[i];
-            modes[i].set_bandpass(freq, q, sample_rate);
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            modes[i].set_bandpass(freq * (1.0 + skew * sign), q, sample_rate);
             mode_gains[i] = gain;
         }
         Self { modes, mode_gains }

@@ -31,7 +31,7 @@ Hexagonal (ports & adapters). The three layers are strictly enforced:
 
 Three threads:
 1. **Main thread** — sets up the engine, hands it to the cpal adapter, then `thread::park()`s.
-2. **Audio (RT) thread** — owned by cpal. Drains MIDI events from the SPSC ring buffer at the top of every callback, then calls `Engine::render(&mut [f32])`. **No allocations, no locks, no logging inside the render loop.** A pre-allocated mono scratch buffer (`MAX_BUFFER_FRAMES = 8192`) is reused every callback.
+2. **Audio (RT) thread** — owned by cpal. Drains MIDI events from the SPSC ring buffer at the top of every callback, then calls `Engine::render_stereo(&mut [f32], &mut [f32])`. **No allocations, no locks, no logging inside the render loop.** A pre-allocated stereo pair of scratch buffers (`MAX_BUFFER_FRAMES = 8192` each) is reused every callback; even device channels get L, odd get R, and a mono device gets the exact `(L+R)/2` downmix (also available as `Engine::render`).
 3. **MIDI thread** — owned by midir. Parses bytes, pushes `MidiEvent`s into the SPSC ring buffer with `try_push` (drops on overflow rather than blocking).
 
 The engine itself is single-threaded and lives on the audio thread. `cpal::Stream` is `!Send` on macOS — that is why `AudioOutput` is not `Send`.
@@ -39,12 +39,15 @@ The engine itself is single-threaded and lives on the audio thread. `cpal::Strea
 ### DSP signal path (engine.rs)
 
 ```
-voices.sum() ──┬────────────────┬── soundboard ── × master_gain ── clip ── output
-               │                │
-               └── × send ── sympathetic ─┘
+voices[i] ── × pan_i ──┐
+     │                 ├─ Σ ──┬── soundboard L/R ── × master_gain ── clip ── L/R
+     └─(unpanned Σ)    │      │
+          └── × send ── sympathetic ─┘ (centred)
 ```
 
-A "voice" is `Hammer → StringGroup (1–3 detuned KarplusStrong strings) → damper envelope`. The string count per voice depends on the MIDI note: bass (≤31) = 1 string, tenor (32–43) = 2, mid/treble (≥44) = 3. Sympathetic output is summed *before* the soundboard so it shares the same plate coloration as played notes — physically correct (real sympathetic strings also drive the bridge).
+Stereo: each voice is panned by note (constant power, A0 left → C8 right, `PAN_WIDTH = 0.55`), and the two channels are coloured by *two* soundboards with slightly skewed mode sets (`SOUNDBOARD_SKEW`) for interchannel decorrelation. `Engine::render` (mono) is the exact `(L+R)/2` downmix of `render_stereo` — tests mostly use it.
+
+A "voice" is `Hammer → StringGroup (1–3 detuned KarplusStrong strings) → damper envelope → (+ HammerKnock attack noise)`. The string count per voice depends on the MIDI note: bass (≤31) = 1 string, tenor (32–43) = 2, mid/treble (≥44) = 3. Strings are stretch-tuned (Railsback cubic in voice.rs — the dispersion model makes ET octaves beat otherwise). Sympathetic output is summed *before* the soundboards so it shares the same plate coloration as played notes — physically correct (real sympathetic strings also drive the bridge).
 
 Each `KarplusStrong` loop is: `delay → loop-LPF → dispersion-allpass-cascade → + excitation → write-back`. Excitation enters undispersed/unfiltered so the player hears the natural strike transient on the first pass.
 

@@ -1,23 +1,34 @@
-//! Pure DSP engine — polyphonic with voice stealing, soundboard
+//! Pure DSP engine — polyphonic with voice stealing, stereo soundboard
 //! coloration, and sympathetic-resonance bank gated by a sustain pedal.
 //!
-//! ## Signal path
+//! ## Signal path (per stereo channel)
 //! ```text
-//!                                  ┌── × master_gain ── soft-clip ── output
-//!                                  │
-//!   voices.sum() ──┬──────────────┬┴─── soundboard ───┘
-//!                  │              │
-//!                  │              │
-//!                  └── × send ── sympathetic ─┘
+//!   voices[i] ── × pan_i ──┐
+//!        │                 ├─ Σ ──┬── soundboard L/R ── × master ── clip ── L/R
+//!        └─(unpanned Σ)    │      │
+//!             │            │      │
+//!             └ × send ── sympathetic ─┘ (centred)
 //! ```
-//! - **Soundboard** applies modal coloration to the combined string +
-//!   sympathetic bus. It is the radiating element of the piano — *every*
-//!   pitched signal passes through it.
-//! - **Sympathetic** is fed a small fraction of the voice bus. It rings
-//!   when the pedal is down and dies quickly when up. Its output joins
-//!   the voice bus *before* the soundboard, so the sympathetic ring is
-//!   coloured by the same plate modes as the played notes (physically:
-//!   sympathetic strings also drive the bridge).
+//! - **Pan**: each voice sits at a constant-power pan position derived from
+//!   its note — bass keys left, treble keys right, as heard from the
+//!   player's seat along the bridge. See [`note_pan_gains`].
+//! - **Soundboard**: TWO modal plates with slightly skewed mode sets (see
+//!   [`Soundboard::new_skewed`]) colour the two channels. The interchannel
+//!   decorrelation they introduce is what widens the image beyond simple
+//!   amplitude panning — a real plate radiates a different modal mix in
+//!   every direction.
+//! - **Sympathetic** is fed the *unpanned* voice sum and returns a centred
+//!   halo, injected before both plates so it shares their coloration
+//!   (physically: sympathetic strings also drive the bridge).
+//! - `render` (mono) is the exact `(L+R)/2` downmix of `render_stereo`.
+//!   It is *not*, however, equivalent to the pre-stereo single-plate bus:
+//!   the two channels are coloured by differently skewed plates and are
+//!   soft-clipped independently before the sum, so the downmix carries the
+//!   average of two skewed mode sets rather than the nominal one. Panning
+//!   also leaves a mild register tilt — a compass-end note sums to
+//!   `(0.938 + 0.346)/2 = 0.642` against a centred note's 0.707, so the
+//!   keyboard extremes sit ≈ 0.9 dB below the middle on a mono device.
+//!   Both are accepted consequences of colouring the channels separately.
 //!
 //! ## Allocation strategy (`pick_slot`)
 //! 1. **Retrigger**: a voice already holding the requested note is
@@ -37,24 +48,51 @@
 //! - Pedal up: every pending note is released for real, and the
 //!   sympathetic bank is damped.
 
+use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
+
 use crate::domain::midi_event::MidiEvent;
 use crate::domain::soundboard::Soundboard;
 use crate::domain::sympathetic::Sympathetic;
-use crate::domain::voice::Voice;
+use crate::domain::voice::{Voice, HIGHEST_KEY, LOWEST_KEY};
 
 pub const MAX_VOICES: usize = 32;
+
+/// Fractional mode-frequency skew of the stereo soundboard pair: the left
+/// plate's modes shift by −this, the right's by +this (alternating per
+/// mode inside each plate). 2.5 % decorrelates the channels audibly while
+/// keeping both on the same modal skeleton.
+const SOUNDBOARD_SKEW: f32 = 0.025;
+
+/// Maximum pan excursion in [0, 1]. 1.0 would put A0/C8 hard left/right;
+/// 0.55 keeps the extremes clearly lateral but still anchored to the case,
+/// the way a listener a few metres from a grand hears the bridge spread.
+const PAN_WIDTH: f32 = 0.55;
+
+/// Constant-power pan gains for a note: A0 left, C8 right, A4 ≈ centre.
+/// `θ` sweeps `[(1−W)·π/4, (1+W)·π/4]`, so `gl² + gr² = 1` everywhere —
+/// equal perceived loudness at every position.
+fn note_pan_gains(note: u8) -> (f32, f32) {
+    // A0..C8; notes outside the compass pin to the ends.
+    let span = (HIGHEST_KEY - LOWEST_KEY) as f32;
+    let t = (note.saturating_sub(LOWEST_KEY) as f32 / span).clamp(0.0, 1.0);
+    let theta = (1.0 + (2.0 * t - 1.0) * PAN_WIDTH) * FRAC_PI_4;
+    (theta.cos(), theta.sin())
+}
 
 pub struct Engine {
     sample_rate: f32,
     voices: [Voice; MAX_VOICES],
+    /// Constant-power pan gains per voice slot, set from the note on
+    /// allocation.
+    pans: [(f32, f32); MAX_VOICES],
     ages: [u64; MAX_VOICES],
     age_counter: u64,
     mono: bool,
-    /// Master gain applied after summing voices, sympathetic and the
-    /// soundboard's wet/dry mix.
+    /// Master gain applied per channel after the soundboard.
     master_gain: f32,
 
-    soundboard: Soundboard,
+    soundboard_l: Soundboard,
+    soundboard_r: Soundboard,
     sympathetic: Sympathetic,
 
     sustain_pedal_down: bool,
@@ -70,18 +108,41 @@ impl Engine {
         Self {
             sample_rate,
             voices,
+            pans: [(FRAC_1_SQRT_2, FRAC_1_SQRT_2); MAX_VOICES],
             ages: [0; MAX_VOICES],
             age_counter: 0,
             mono: false,
-            // Calibrated so a single ff note peaks ≈ 0.5 and a two-note ff
-            // chord just reaches into the soft-clip knee, while ordinary
-            // 2–3 note mf chords stay fully linear — a real soundboard does
-            // not distort at mf. Nudged up from 0.34 when the strike comb
-            // removed the DC pedestal the unipolar hammer pulse used to
-            // park in every loop (that inaudible offset was inflating peak
-            // readings and stealing clip headroom).
-            master_gain: 0.38,
-            soundboard: Soundboard::new(sample_rate),
+            // Calibrated so that ordinary playing is perfectly linear and
+            // only genuinely dense fortissimo clusters reach the soft-clip
+            // knee at SOFT_CLIP_THRESHOLD — a real soundboard does not
+            // distort at mf.
+            //
+            // Why 0.405 and not 0.38·√2 ≈ 0.54: the "√2 restores the
+            // pre-stereo level" argument only holds at pan centre. Constant
+            // -power panning puts up to cos((1−PAN_WIDTH)·π/4) = 0.938 into
+            // a note's near channel, not 1/√2 = 0.707, so a compass-end note
+            // runs 2.4 dB hotter than that derivation assumes. Dividing by
+            // that worst-case pan gain (0.54/0.938 ≈ 0.405) makes the hottest
+            // channel match the pre-stereo bus instead of the coldest one.
+            //
+            // Measured per-channel peaks at 48 kHz, 1 s render, velocity 127
+            // unless noted (see the tests below):
+            //   single ff, centred (60)     0.452   linear
+            //   single ff, bass (24)        0.410   linear
+            //   3-note mf, centred (vel 64) 0.363   linear
+            //   2-note ff, centred (60,64)  0.839   linear, just under the knee
+            //   2-note ff, bass (24,31)     0.787   linear
+            //   3-note ff, bass (24,28,31)  0.999   1.20 pre-clip → deep in the knee
+            //
+            // The last row is the accepted limit: a fortissimo three-note
+            // bass cluster is exactly the "dense ff" case the saturator
+            // exists for. Pulling it under the knee too would need ≈ 0.30,
+            // i.e. 5.2 dB off the whole instrument, which is not worth it.
+            // Raising PAN_WIDTH or this gain trades directly against all of
+            // the above.
+            master_gain: 0.405,
+            soundboard_l: Soundboard::new_skewed(sample_rate, -SOUNDBOARD_SKEW),
+            soundboard_r: Soundboard::new_skewed(sample_rate, SOUNDBOARD_SKEW),
             sympathetic: Sympathetic::new(sample_rate),
             sustain_pedal_down: false,
             pending_note_offs: [false; 128],
@@ -160,35 +221,66 @@ impl Engine {
         }
     }
 
-    pub fn render(&mut self, buf: &mut [f32]) {
+    /// One stereo output frame: pan and sum the voices, drive the
+    /// sympathetic bank with the unpanned sum, colour each channel with its
+    /// own plate, then gain + soft-clip.
+    #[inline]
+    fn tick_frame(&mut self) -> (f32, f32) {
+        let mut l = 0.0f32;
+        let mut r = 0.0f32;
+        let mut voice_sum = 0.0f32;
         if self.mono {
-            for s in buf.iter_mut() {
-                let voice_sum = self.voices[0].tick();
-                let sympa = self.sympathetic.tick(voice_sum);
-                let body = self.soundboard.tick(voice_sum + sympa);
-                *s = clip(body * self.master_gain);
+            let s = self.voices[0].tick();
+            let (gl, gr) = self.pans[0];
+            voice_sum = s;
+            l = s * gl;
+            r = s * gr;
+        } else {
+            for (v, &(gl, gr)) in self.voices.iter_mut().zip(&self.pans) {
+                let s = v.tick();
+                voice_sum += s;
+                l += s * gl;
+                r += s * gr;
             }
-            return;
         }
+        // Centred at constant power: 1/√2 into each channel.
+        let sympa = self.sympathetic.tick(voice_sum) * FRAC_1_SQRT_2;
+        let bl = self.soundboard_l.tick(l + sympa);
+        let br = self.soundboard_r.tick(r + sympa);
+        (clip(bl * self.master_gain), clip(br * self.master_gain))
+    }
+
+    /// Stereo render. `left` and `right` must be the same length — a
+    /// mismatch renders only the shorter and leaves stale samples in the
+    /// longer, which the cpal adapter would play as a glitch (it relies on
+    /// this filling every frame and does no pre-zeroing).
+    pub fn render_stereo(&mut self, left: &mut [f32], right: &mut [f32]) {
+        debug_assert_eq!(left.len(), right.len(), "stereo buffers must match");
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let (a, b) = self.tick_frame();
+            *l = a;
+            *r = b;
+        }
+    }
+
+    /// Mono render: the exact `(L+R)/2` downmix of [`Engine::render_stereo`].
+    pub fn render(&mut self, buf: &mut [f32]) {
         for s in buf.iter_mut() {
-            let mut voice_sum = 0.0f32;
-            for v in &mut self.voices {
-                voice_sum += v.tick();
-            }
-            let sympa = self.sympathetic.tick(voice_sum);
-            let body = self.soundboard.tick(voice_sum + sympa);
-            *s = clip(body * self.master_gain);
+            let (l, r) = self.tick_frame();
+            *s = 0.5 * (l + r);
         }
     }
 
     fn alloc_voice(&mut self, note: u8, velocity: u8) {
         if self.mono {
             self.voices[0].note_on(note, velocity);
+            self.pans[0] = note_pan_gains(note);
             self.bump_age(0);
             return;
         }
         let idx = self.pick_slot(note);
         self.voices[idx].note_on(note, velocity);
+        self.pans[idx] = note_pan_gains(note);
         self.bump_age(idx);
     }
 
@@ -257,12 +349,13 @@ impl Engine {
     }
 }
 
-/// Amplitude below which the output bus is passed through untouched. With
-/// `master_gain = 0.38` a single fortissimo note peaks ≈ 0.5 and even an
-/// ordinary mezzo-forte 3-note chord stays below this knee, so normal
-/// playing is perfectly linear; the saturator only engages on genuinely
-/// dense fortissimo clusters. 0.88 leaves 0.12 of range for the soft knee
-/// to curve through before reaching ±1.
+/// Amplitude below which each output channel is passed through untouched.
+/// With `master_gain = 0.405` (see its comment for the full measured table)
+/// a single fortissimo note peaks ≈ 0.45 per channel, a mezzo-forte 3-note
+/// chord ≈ 0.36 and even a two-note ff chord ≈ 0.84, so normal playing is
+/// perfectly linear; the saturator only engages on genuinely dense
+/// fortissimo clusters. 0.88 leaves 0.12 of range for the soft knee to
+/// curve through before reaching ±1.
 const SOFT_CLIP_THRESHOLD: f32 = 0.88;
 
 /// Soft-clip the output bus to ±1 with a tanh knee above
@@ -547,21 +640,136 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ff_chord_enters_soft_knee_below_rail() {
-        // After the lowered master_gain, a two-note fortissimo chord just
-        // reaches into the soft knee (peak ≈ 0.94): above the 0.88 threshold
-        // yet strictly below the ±1 rail. This proves the bus *approaches*
-        // the rail gradually through the tanh knee instead of being pinned
-        // flat by a hard clip — while ordinary mf playing stays fully linear
-        // thanks to the new headroom.
+    // ─── Stereo tests ─────────────────────────────────────────────────
+
+    fn channel_rms_for_note(note: u8) -> (f32, f32) {
         let mut eng = Engine::new(48_000.0);
-        eng.handle_event(MidiEvent::note_on(60, 127));
-        eng.handle_event(MidiEvent::note_on(64, 127));
-        let mut buf = vec![0.0; 9_600]; // 200 ms
-        eng.render(&mut buf);
-        let peak = buf.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
-        assert!(peak > 0.88, "ff chord should reach into the knee: {peak}");
-        assert!(peak < 1.0, "soft knee should stay below the rail: {peak}");
+        eng.handle_event(MidiEvent::note_on(note, 100));
+        let n = 9_600; // 200 ms
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        eng.render_stereo(&mut l, &mut r);
+        let rms = |b: &[f32]| (b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32).sqrt();
+        (rms(&l), rms(&r))
+    }
+
+    #[test]
+    fn bass_pans_left_treble_pans_right() {
+        let (bl, br) = channel_rms_for_note(24); // C1
+        assert!(bl > br * 1.3, "bass should favour left: l={bl} r={br}");
+        let (tl, tr) = channel_rms_for_note(105); // A7
+        assert!(tr > tl * 1.3, "treble should favour right: l={tl} r={tr}");
+    }
+
+    #[test]
+    fn stereo_channels_are_decorrelated_but_coherent() {
+        // A centre-register chord reaches both channels at similar level,
+        // but the skewed plates must decorrelate the fine structure: the
+        // normalised cross-correlation stays clearly below 1 (mono would be
+        // exactly 1) and above 0 (the channels are the same notes, not two
+        // different signals).
+        let mut eng = Engine::new(48_000.0);
+        for n in [60, 64, 67] {
+            eng.handle_event(MidiEvent::note_on(n, 100));
+        }
+        let n = 48_000;
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        eng.render_stereo(&mut l, &mut r);
+        let (mut lr, mut ll, mut rr) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            lr += (l[i] * r[i]) as f64;
+            ll += (l[i] * l[i]) as f64;
+            rr += (r[i] * r[i]) as f64;
+        }
+        let corr = lr / (ll * rr).sqrt().max(1e-30);
+        assert!(
+            (0.2..0.995).contains(&corr),
+            "stereo correlation out of range: {corr}"
+        );
+    }
+
+    #[test]
+    fn mono_render_is_exact_downmix_of_stereo() {
+        let events = [
+            MidiEvent::note_on(36, 110),
+            MidiEvent::note_on(60, 90),
+            MidiEvent::note_on(96, 70),
+        ];
+        let mut eng_mono = Engine::new(48_000.0);
+        let mut eng_stereo = Engine::new(48_000.0);
+        for ev in events {
+            eng_mono.handle_event(ev);
+            eng_stereo.handle_event(ev);
+        }
+        let n = 4_096;
+        let mut mono = vec![0.0; n];
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        eng_mono.render(&mut mono);
+        eng_stereo.render_stereo(&mut l, &mut r);
+        for i in 0..n {
+            assert_eq!(
+                mono[i],
+                0.5 * (l[i] + r[i]),
+                "downmix mismatch at sample {i}"
+            );
+        }
+    }
+
+    /// Worst per-channel peak over a 1 s render of `notes` struck together.
+    ///
+    /// Headroom must be measured per channel, not on the mono downmix: the
+    /// `(L+R)/2` average cancels exactly the pan boost that eats the
+    /// headroom, so a downmix test would pass no matter how hot the panned
+    /// channels ran.
+    fn peak_per_channel(notes: &[u8], velocity: u8) -> f32 {
+        let mut eng = Engine::new(48_000.0);
+        for &n in notes {
+            eng.handle_event(MidiEvent::note_on(n, velocity));
+        }
+        let mut l = vec![0.0; 48_000];
+        let mut r = vec![0.0; 48_000];
+        eng.render_stereo(&mut l, &mut r);
+        l.iter()
+            .chain(r.iter())
+            .map(|s| s.abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn ordinary_playing_stays_below_the_soft_knee_on_every_channel() {
+        // The calibration promise of `master_gain`: everything short of a
+        // dense ff cluster is passed through untouched. Bass notes are the
+        // demanding case — panning puts 0.938 of them into one channel — so
+        // they are covered explicitly rather than only through the downmix.
+        for (label, notes, vel) in [
+            ("single ff centred", &[60u8][..], 127),
+            ("single ff bass", &[24u8][..], 127),
+            ("3-note mf centred", &[60u8, 64, 67][..], 64),
+            ("2-note ff centred", &[60u8, 64][..], 127),
+            ("2-note ff bass", &[24u8, 31][..], 127),
+        ] {
+            let peak = peak_per_channel(notes, vel);
+            assert!(
+                peak < SOFT_CLIP_THRESHOLD,
+                "{label} must stay linear on both channels: peak {peak} \
+                 reached the {SOFT_CLIP_THRESHOLD} knee"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_ff_bass_cluster_uses_the_knee_without_hitting_the_rail() {
+        // The accepted limit case. It *should* engage the saturator — that
+        // is what the saturator is for — but must approach ±1 gradually
+        // through the tanh knee rather than being pinned flat by a hard
+        // clip. Measured 0.9988 (≈ 1.20 before the knee).
+        let peak = peak_per_channel(&[24, 28, 31], 127);
+        assert!(
+            peak > SOFT_CLIP_THRESHOLD,
+            "dense ff bass cluster should reach the knee: {peak}"
+        );
+        assert!(peak < 1.0, "soft knee must stay below the rail: {peak}");
     }
 }
