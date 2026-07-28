@@ -91,6 +91,26 @@ const DECAY_T60_FACTORS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1]
 /// emerges as the main string fades.
 const BASS_POLARIZATION_T60_FACTOR: f32 = 1.9;
 
+/// Half-width of the per-note detune jitter, as a fraction of the nominal
+/// detune. A technician never leaves every unison at the *same* offset:
+/// each note carries its own micro-tuning, and that per-note variation of
+/// beat rates is part of why 88 keys read as one organic instrument rather
+/// than one sample transposed. Jitter is derived deterministically from the
+/// note's frequency bits, so a given note always beats the same way (its
+/// "fingerprint") and renders stay reproducible.
+const DETUNE_JITTER: f32 = 0.35;
+
+/// Deterministic multiplier in `[1 − DETUNE_JITTER, 1 + DETUNE_JITTER]`
+/// derived from `seed` via one xorshift32 round.
+fn detune_jitter_factor(seed: u32) -> f32 {
+    let mut x = seed | 1;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    let unit = x as f32 / 4_294_967_296.0; // [0, 1)
+    1.0 + DETUNE_JITTER * (2.0 * unit - 1.0)
+}
+
 /// `1/√N` normalisation factors, indexed by `active_count`. Pre-computed
 /// to keep the audio path free of square roots.
 const STRING_NORM_FACTOR: [f32; MAX_STRINGS_PER_NOTE + 1] = [
@@ -176,14 +196,18 @@ impl StringGroup {
     }
 
     /// Pluck `n_strings` (clamped to [1, MAX]) tuned around `center_hz`
-    /// with the per-count detune profile. Strings beyond `n_strings`
-    /// are deactivated.
+    /// with the per-count detune profile, each offset scaled by the note's
+    /// deterministic jitter fingerprint. Strings beyond `n_strings` are
+    /// deactivated.
     pub fn pluck(&mut self, center_hz: f32, n_strings: usize) {
         let n = n_strings.clamp(1, MAX_STRINGS_PER_NOTE);
         self.active_count = n;
         let detunes = DETUNE_CENTS[n];
+        let seed = center_hz.to_bits();
         for (i, &cents) in detunes.iter().enumerate().take(n) {
-            let f = center_hz * 2.0f32.powf(cents / 1200.0);
+            let jittered = cents
+                * detune_jitter_factor(seed.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9)));
+            let f = center_hz * 2.0f32.powf(jittered / 1200.0);
             self.strings[i].pluck(f);
         }
         for i in n..MAX_STRINGS_PER_NOTE {
@@ -193,7 +217,9 @@ impl StringGroup {
         // its horizontal polarization (see module docs).
         self.bass_polarization = n == 1;
         if self.bass_polarization {
-            let f = center_hz * 2.0f32.powf(BASS_POLARIZATION_DETUNE_CENTS / 1200.0);
+            let jittered = BASS_POLARIZATION_DETUNE_CENTS
+                * detune_jitter_factor(seed.wrapping_add(3u32.wrapping_mul(0x9E37_79B9)));
+            let f = center_hz * 2.0f32.powf(jittered / 1200.0);
             self.strings[1].pluck(f);
         }
     }
@@ -305,6 +331,29 @@ mod tests {
         for _ in 0..512 {
             assert_eq!(g.tick(0.0), 0.0);
         }
+    }
+
+    #[test]
+    fn detune_jitter_is_bounded_and_note_specific() {
+        // Every factor stays inside [1−J, 1+J]; the same seed always yields
+        // the same factor (reproducible renders); and across the keyboard the
+        // factors actually vary (no uniform beat fingerprint).
+        let mut distinct = std::collections::HashSet::new();
+        for note in 21..=108u32 {
+            let freq = 440.0f32 * 2.0f32.powf((note as f32 - 69.0) / 12.0);
+            let f = detune_jitter_factor(freq.to_bits());
+            assert!(
+                (1.0 - DETUNE_JITTER..=1.0 + DETUNE_JITTER).contains(&f),
+                "factor out of bounds at note {note}: {f}"
+            );
+            assert_eq!(f, detune_jitter_factor(freq.to_bits()), "not deterministic");
+            distinct.insert(f.to_bits());
+        }
+        assert!(
+            distinct.len() > 60,
+            "jitter should vary across notes: {} distinct",
+            distinct.len()
+        );
     }
 
     /// Two-stage decay: the tail of a group whose unison T60s are spread
