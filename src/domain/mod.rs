@@ -7,6 +7,7 @@ pub mod dispersion;
 pub mod engine;
 pub mod filter;
 pub mod hammer;
+pub mod knock;
 pub mod midi_event;
 pub mod soundboard;
 pub mod strike_comb;

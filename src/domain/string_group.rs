@@ -26,15 +26,22 @@
 //! horizontal polarization. It reuses one of the pre-allocated string slots,
 //! so it costs nothing extra at construction time.
 //!
-//! ## What this module does NOT model
+//! ## Two-stage decay (approximated)
 //! Real strings are mechanically coupled through the bridge, which causes
 //! a "two-stage decay": an initial fast decay from the in-phase mode whose
-//! energy leaves through the bridge, then a long slow tail from the
-//! out-of-phase mode whose net force on the bridge is small (Weinreich
-//! 1977). Implementing that needs a coupled-waveguide network with a
-//! shared termination filter — useful enough to be a candidate for a
-//! Phase 5b refinement, but out of scope here. (The bass polarization pair
-//! above shares one loop gain, so both decay at the same rate.)
+//! energy leaves through the bridge, then a long slow tail ("aftersound")
+//! from the out-of-phase mode whose net force on the bridge is small
+//! (Weinreich 1977). The full model needs a coupled-waveguide network with
+//! a shared termination filter; we approximate its *audible signature*
+//! instead: each unison string gets a different T60 (see
+//! [`DECAY_T60_FACTORS`]), so the summed envelope starts at the average
+//! decay rate and flattens as the slowest string takes over — a convex
+//! dB-envelope with a distinct knee, where a single loop gain gives the
+//! straight-line exponential that reads as "electronic". Single-string
+//! bass notes get the same treatment through their polarization pair: the
+//! horizontal polarization decays much more slowly
+//! ([`BASS_POLARIZATION_T60_FACTOR`]), which is precisely Weinreich's
+//! vertical→horizontal aftersound.
 
 use crate::domain::string::KarplusStrong;
 
@@ -63,6 +70,46 @@ const DETUNE_CENTS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
 /// into via the bridge).
 const BASS_POLARIZATION_DETUNE_CENTS: f32 = 1.4;
 const BASS_POLARIZATION_WEIGHT: f32 = 0.35;
+
+/// Per-string T60 multipliers, indexed by `[active_count][string_index]`.
+/// The spread around the nominal per-note T60 is what produces the
+/// two-stage decay (see module docs): the fastest string dominates the
+/// early slope, the slowest owns the tail. Values keep the *geometric
+/// mean* close to 1 so the overall note length stays near the nominal
+/// target the voice installs.
+const DECAY_T60_FACTORS: [[f32; MAX_STRINGS_PER_NOTE]; MAX_STRINGS_PER_NOTE + 1] = [
+    [1.0, 1.0, 1.0],  // n=0 (unused)
+    [1.0, 1.0, 1.0],  // n=1: single string (polarization handled below)
+    [0.75, 1.3, 1.0], // n=2
+    [0.7, 1.0, 1.35], // n=3
+];
+
+/// T60 multiplier for the bass polarization loop. The horizontal
+/// polarization couples weakly to the bridge, so it outlives the struck
+/// vertical polarization by a wide margin — Weinreich's "aftersound". At
+/// its 0.35 output weight the tail sits ≈ 9 dB below the note's body and
+/// emerges as the main string fades.
+const BASS_POLARIZATION_T60_FACTOR: f32 = 1.9;
+
+/// Half-width of the per-note detune jitter, as a fraction of the nominal
+/// detune. A technician never leaves every unison at the *same* offset:
+/// each note carries its own micro-tuning, and that per-note variation of
+/// beat rates is part of why 88 keys read as one organic instrument rather
+/// than one sample transposed. Jitter is derived deterministically from the
+/// note's frequency bits, so a given note always beats the same way (its
+/// "fingerprint") and renders stay reproducible.
+const DETUNE_JITTER: f32 = 0.35;
+
+/// Deterministic multiplier in `[1 − DETUNE_JITTER, 1 + DETUNE_JITTER]`
+/// derived from `seed` via one xorshift32 round.
+fn detune_jitter_factor(seed: u32) -> f32 {
+    let mut x = seed | 1;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    let unit = x as f32 / 4_294_967_296.0; // [0, 1)
+    1.0 + DETUNE_JITTER * (2.0 * unit - 1.0)
+}
 
 /// `1/√N` normalisation factors, indexed by `active_count`. Pre-computed
 /// to keep the audio path free of square roots.
@@ -110,14 +157,20 @@ impl StringGroup {
         self.active_count
     }
 
-    /// Set the per-cycle loop loss on every string in the group. The voice
-    /// uses this to give each note a pitch-dependent decay rate: without it
-    /// the only loss is the loop LPF, which barely touches the fundamental
-    /// of bass/mid notes (they would ring almost forever). See
-    /// [`crate::domain::voice`] for the T60 → loop-gain mapping.
+    /// Set the per-cycle loop loss for the group from the note's *nominal*
+    /// loop gain (see [`crate::domain::voice`] for the T60 → gain mapping).
+    /// Each string receives `gain^(1/factor)` — a per-cycle gain whose T60
+    /// is the nominal times its [`DECAY_T60_FACTORS`] entry — so the unison
+    /// decays at spread rates and the summed envelope shows the two-stage
+    /// knee (module docs). Call after [`StringGroup::pluck`], which sets
+    /// the string count the factor lookup depends on.
     pub fn set_loop_gain(&mut self, gain: f32) {
-        for s in &mut self.strings {
-            s.set_loop_gain(gain);
+        let factors = &DECAY_T60_FACTORS[self.active_count];
+        for (s, &factor) in self.strings.iter_mut().zip(factors).take(self.active_count) {
+            s.set_loop_gain(gain.powf(1.0 / factor));
+        }
+        if self.bass_polarization {
+            self.strings[1].set_loop_gain(gain.powf(1.0 / BASS_POLARIZATION_T60_FACTOR));
         }
     }
 
@@ -132,15 +185,29 @@ impl StringGroup {
         }
     }
 
+    /// Scale every string's loop state by `g` — see
+    /// [`KarplusStrong::scale_state`]. The group's output drops to `g` times
+    /// what it was, continuously, while any excitation fed in afterwards
+    /// still passes at full level.
+    pub fn scale_state(&mut self, g: f32) {
+        for s in &mut self.strings {
+            s.scale_state(g);
+        }
+    }
+
     /// Pluck `n_strings` (clamped to [1, MAX]) tuned around `center_hz`
-    /// with the per-count detune profile. Strings beyond `n_strings`
-    /// are deactivated.
+    /// with the per-count detune profile, each offset scaled by the note's
+    /// deterministic jitter fingerprint. Strings beyond `n_strings` are
+    /// deactivated.
     pub fn pluck(&mut self, center_hz: f32, n_strings: usize) {
         let n = n_strings.clamp(1, MAX_STRINGS_PER_NOTE);
         self.active_count = n;
         let detunes = DETUNE_CENTS[n];
+        let seed = center_hz.to_bits();
         for (i, &cents) in detunes.iter().enumerate().take(n) {
-            let f = center_hz * 2.0f32.powf(cents / 1200.0);
+            let jittered = cents
+                * detune_jitter_factor(seed.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9)));
+            let f = center_hz * 2.0f32.powf(jittered / 1200.0);
             self.strings[i].pluck(f);
         }
         for i in n..MAX_STRINGS_PER_NOTE {
@@ -150,7 +217,9 @@ impl StringGroup {
         // its horizontal polarization (see module docs).
         self.bass_polarization = n == 1;
         if self.bass_polarization {
-            let f = center_hz * 2.0f32.powf(BASS_POLARIZATION_DETUNE_CENTS / 1200.0);
+            let jittered = BASS_POLARIZATION_DETUNE_CENTS
+                * detune_jitter_factor(seed.wrapping_add(3u32.wrapping_mul(0x9E37_79B9)));
+            let f = center_hz * 2.0f32.powf(jittered / 1200.0);
             self.strings[1].pluck(f);
         }
     }
@@ -262,6 +331,82 @@ mod tests {
         for _ in 0..512 {
             assert_eq!(g.tick(0.0), 0.0);
         }
+    }
+
+    #[test]
+    fn detune_jitter_is_bounded_and_note_specific() {
+        // Every factor stays inside [1−J, 1+J]; the same seed always yields
+        // the same factor (reproducible renders); and across the keyboard the
+        // factors actually vary (no uniform beat fingerprint).
+        let mut distinct = std::collections::HashSet::new();
+        for note in 21..=108u32 {
+            let freq = 440.0f32 * 2.0f32.powf((note as f32 - 69.0) / 12.0);
+            let f = detune_jitter_factor(freq.to_bits());
+            assert!(
+                (1.0 - DETUNE_JITTER..=1.0 + DETUNE_JITTER).contains(&f),
+                "factor out of bounds at note {note}: {f}"
+            );
+            assert_eq!(f, detune_jitter_factor(freq.to_bits()), "not deterministic");
+            distinct.insert(f.to_bits());
+        }
+        assert!(
+            distinct.len() > 60,
+            "jitter should vary across notes: {} distinct",
+            distinct.len()
+        );
+    }
+
+    /// Two-stage decay: the tail of a group whose unison T60s are spread
+    /// must far outlive the tail of the same group forced to a uniform
+    /// nominal gain (the pre-spread behaviour). Comparing against the
+    /// uniform twin isolates the spread's contribution — the loop LPF's
+    /// spectral decay affects both renders identically.
+    fn late_tail_rms(n_strings: usize, freq: f32, t60: f32, uniform: bool) -> f32 {
+        const SR: f32 = 48_000.0;
+        let mut g = StringGroup::new(SR, 4096);
+        g.pluck(freq, n_strings);
+        // Nominal per-cycle gain for the requested T60 (same formula the
+        // voice uses): gain = exp(ln(10⁻³) / (f₀·T60)).
+        let gain = (-6.907_755_3 / (freq * t60)).exp();
+        if uniform {
+            // Bypass the group's factor table: every loop (including the
+            // bass polarization slot) decays at the nominal rate.
+            for s in &mut g.strings {
+                s.set_loop_gain(gain);
+            }
+        } else {
+            g.set_loop_gain(gain);
+        }
+        let n = (4.0 * SR) as usize;
+        let mut buf = vec![0.0f32; n];
+        buf[0] = g.tick(1.0);
+        for v in buf.iter_mut().skip(1) {
+            *v = g.tick(0.0);
+        }
+        let tail = &buf[(3.5 * SR) as usize..];
+        (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn unison_spread_produces_two_stage_decay() {
+        let spread = late_tail_rms(3, 440.0, 1.5, false);
+        let uniform = late_tail_rms(3, 440.0, 1.5, true);
+        assert!(
+            spread > uniform * 4.0,
+            "spread T60s should leave a much longer tail: spread={spread} uniform={uniform}"
+        );
+    }
+
+    #[test]
+    fn bass_polarization_produces_aftersound() {
+        // Single wound string: the long-lived horizontal polarization must
+        // carry the tail once the struck vertical polarization has faded.
+        let spread = late_tail_rms(1, 65.4, 2.0, false);
+        let uniform = late_tail_rms(1, 65.4, 2.0, true);
+        assert!(
+            spread > uniform * 4.0,
+            "polarization aftersound missing: spread={spread} uniform={uniform}"
+        );
     }
 
     /// Detune breaks perfect periodicity. With 3 strings tuned slightly

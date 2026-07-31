@@ -1,6 +1,6 @@
 //! Driving / driven adapters. Translate the outside world (cpal, midir)
 //! into the engine's [`MidiEvent`](crate::domain::MidiEvent) language and
-//! consume its rendered mono samples.
+//! consume its rendered stereo samples.
 
 pub mod cpal_output;
 pub mod midir_input;

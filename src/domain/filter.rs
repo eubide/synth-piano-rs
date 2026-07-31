@@ -103,6 +103,13 @@ impl AllpassFirstOrder {
         self.y_prev = 0.0;
     }
 
+    /// Multiply the filter state by `g`. The filter is linear, so this
+    /// scales its whole future zero-input response by `g`.
+    pub fn scale_state(&mut self, g: f32) {
+        self.x_prev *= g;
+        self.y_prev *= g;
+    }
+
     /// Direct-form I implementation:
     ///   `y[n] = a·x[n] + x[n-1] − a·y[n-1]`
     /// Two multiplications, one addition, one subtraction.
@@ -148,6 +155,11 @@ impl TwoTapLowpass {
 
     pub fn reset(&mut self) {
         self.prev = 0.0;
+    }
+
+    /// Multiply the filter state by `g` (see [`AllpassFirstOrder::scale_state`]).
+    pub fn scale_state(&mut self, g: f32) {
+        self.prev *= g;
     }
 
     #[inline]

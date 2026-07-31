@@ -29,16 +29,19 @@
 //!
 //! ## Signal flow at the engine level
 //! ```text
-//!   voice_sum ──┬──────────────────────┬── soundboard ── master
+//!   voice_sum ──┬──────────────────────┬── soundboard L/R ── master
 //!               │                      │
-//!               └── × SEND ── sympathetic ─┘
+//!               └── × SEND ── sympathetic ─┘ (centred)
 //! ```
-//! The sympathetic output is summed back into the bus before the
-//! soundboard so the bank's contribution gets the same modal coloration
-//! as the played strings — which is what physically happens.
+//! The sympathetic output is summed back into the bus before *both*
+//! soundboard plates so the bank's contribution gets the same modal
+//! coloration as the played strings — which is what physically happens. It
+//! is fed the unpanned voice sum and returns to centre, because the whole
+//! undamped bank rings as one body rather than tracking the struck note's
+//! position along the bridge.
 
 use crate::domain::string::KarplusStrong;
-use crate::domain::voice::midi_to_hz;
+use crate::domain::voice::stretched_midi_to_hz;
 
 /// Lowest sympathetic note (C2 = MIDI 36). The bank spans up from here.
 const BASE_NOTE: u8 = 36;
@@ -81,14 +84,15 @@ impl Sympathetic {
         // group delay; DelayLine then rounds the capacity up to the next
         // power of two. Deriving `lowest_freq` from `BASE_NOTE` keeps this
         // self-consistent if the bank's range is ever changed.
-        let lowest_freq = midi_to_hz(BASE_NOTE);
+        let lowest_freq = stretched_midi_to_hz(BASE_NOTE);
         let max_delay = (sample_rate * 1.5 / lowest_freq).ceil() as usize;
         let mut strings: [KarplusStrong; N_STRINGS] =
             std::array::from_fn(|_| KarplusStrong::new(sample_rate, max_delay));
-        // Arm each string at its assigned note and start with damper engaged.
+        // Arm each string at its assigned note (stretch-tuned, so it lines
+        // up with the played strings) and start with damper engaged.
         for (i, s) in strings.iter_mut().enumerate() {
             let note = BASE_NOTE + i as u8;
-            s.pluck(midi_to_hz(note));
+            s.pluck(stretched_midi_to_hz(note));
             s.set_loop_gain(PEDAL_UP_LOOP_GAIN);
         }
         Self { strings }

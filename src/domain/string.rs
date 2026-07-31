@@ -120,6 +120,20 @@ impl KarplusStrong {
         self.active = false;
     }
 
+    /// Scale the *entire* loop state (delay line, tuner, LPF, dispersion)
+    /// by `g`. Every element in the loop is linear, so this multiplies the
+    /// string's whole future zero-input output by `g` exactly, with no
+    /// discontinuity at the sample where it is applied — and, crucially,
+    /// without touching the excitation that arrives afterwards. That is what
+    /// lets the voice fold a partially engaged damper into the string
+    /// instead of muting a fresh strike (see [`crate::domain::voice`]).
+    pub fn scale_state(&mut self, g: f32) {
+        self.delay.scale(g);
+        self.tuning.scale_state(g);
+        self.lpf.scale_state(g);
+        self.dispersion.scale_state(g);
+    }
+
     /// Arm the string at a given fundamental frequency. Clears delay,
     /// loop filter and dispersion state, picks a per-note dispersion
     /// coefficient, and tunes the delay length so `f₀` still lands on

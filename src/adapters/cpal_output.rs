@@ -5,8 +5,9 @@
 //! and warn; the engine adapts to whatever sample rate it ends up with.
 //!
 //! ## Real-time discipline
-//! - No heap allocations inside the callback. A single mono scratch buffer
-//!   is allocated at construction (`MAX_BUFFER_FRAMES`) and reused.
+//! - No heap allocations inside the callback. A stereo pair of scratch
+//!   buffers is allocated at construction (`MAX_BUFFER_FRAMES` each) and
+//!   reused every block.
 //! - The consumer end of the MIDI ring buffer is drained at the start of
 //!   each block. Engine state never crosses thread boundaries.
 //! - Errors during stream callback are logged at most every N occurrences
@@ -22,7 +23,7 @@ use crate::ports::AudioOutput;
 
 /// Hard upper bound on the cpal buffer size we will service. The consigna
 /// asks for 256, but some hosts deliver larger blocks (especially when the
-/// device is shared). We size the mono scratch to cover the worst case.
+/// device is shared). We size each scratch buffer to cover the worst case.
 const MAX_BUFFER_FRAMES: usize = 8_192;
 
 /// Target sample rate from the spec.
@@ -157,7 +158,10 @@ where
     T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>,
 {
     let channels = config.channels as usize;
-    let mut mono = vec![0.0f32; MAX_BUFFER_FRAMES]; // pre-allocated scratch
+    let mono_device = channels == 1;
+    // Pre-allocated stereo scratch buffers, reused every callback.
+    let mut left = vec![0.0f32; MAX_BUFFER_FRAMES];
+    let mut right = vec![0.0f32; MAX_BUFFER_FRAMES];
 
     let stream = device
         .build_output_stream(
@@ -168,26 +172,37 @@ where
                     engine.handle_event(ev);
                 }
 
-                // 2. Render mono into the scratch buffer.
+                // 2. Render stereo into the scratch buffers (render_stereo
+                //    assigns every sample; no pre-zeroing needed).
                 let frames = data.len() / channels.max(1);
                 let frames = frames.min(MAX_BUFFER_FRAMES);
-                let slice = &mut mono[..frames];
-                for s in slice.iter_mut() {
-                    *s = 0.0;
-                }
-                engine.render(slice);
+                engine.render_stereo(&mut left[..frames], &mut right[..frames]);
 
-                // 3. Fan mono → multi-channel output.
+                // 3. Write L/R into the device frame. A mono device gets the
+                //    exact downmix; anything else gets L in channel 0, R in
+                //    channel 1, silence elsewhere. We deliberately do *not*
+                //    fan out to the remaining channels: in standard WAVE
+                //    order (FL, FR, FC, LFE, BL, BR) channel 3 is the LFE
+                //    feed, and sending it a full-bandwidth piano signal is
+                //    both wrong and potentially damaging to a subwoofer.
+                //    The channel count is fixed for the stream's lifetime, so
+                //    the mono/stereo decision is hoisted out of the per-frame
+                //    loop rather than re-tested on every sample.
                 for (frame_idx, frame) in data.chunks_mut(channels).enumerate() {
-                    let sample = if frame_idx < frames {
-                        mono[frame_idx]
+                    let (l, r) = if frame_idx < frames {
+                        (left[frame_idx], right[frame_idx])
                     } else {
                         // Block bigger than our scratch — pad silence rather than panic.
-                        0.0
+                        (0.0, 0.0)
                     };
-                    let converted = T::from_sample(sample);
-                    for ch in frame.iter_mut() {
-                        *ch = converted;
+                    if mono_device {
+                        frame[0] = T::from_sample(0.5 * (l + r));
+                    } else {
+                        frame[0] = T::from_sample(l);
+                        frame[1] = T::from_sample(r);
+                        for out in frame.iter_mut().skip(2) {
+                            *out = T::from_sample(0.0f32);
+                        }
                     }
                 }
             },
